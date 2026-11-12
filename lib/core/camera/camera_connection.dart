@@ -432,7 +432,10 @@ final class CameraConnectionImpl implements CameraConnection {
       // Zf)。USB 路无实例名,同样拼装(见 _openSessionOrReject 沿)。
       _deviceName = _deviceLabel(info, instanceName);
       _deviceModel = info.model;
-      if (await _needsPairing(info)) {
+      // Z 30 通过 STA 可在初始会话读卡。完成配对后的重连曾切到
+      // 设备信息不同且拒绝读卡的状态，图库连接保留初始会话。
+      final galleryFirst = rememberIp && _isZ30(info.model);
+      if (!galleryFirst && await _needsPairing(info)) {
         switch (await _runPairing(info, ip, instanceName,
             rememberIp: rememberIp)) {
           case _PairResult.newlyPaired:
@@ -483,8 +486,8 @@ final class CameraConnectionImpl implements CameraConnection {
       // 很久的场景之一)—— 预算内收不掉就按「连接超时」failed 收口。
       // STA 的 Z 30 已在真机复现：直接读卡正常，0x90C2(1) 后相机断开。
       // STA 保存可复用地址，AP 调用以 rememberIp: false 保留原有遥控路径。
-      if (rememberIp && _isZ30(info.model)) {
-        AppLog.i(AppLog.connection, 'Z 30 STA: 保留读卡会话，跳过连接时的遥控切换');
+      if (galleryFirst) {
+        AppLog.i(AppLog.connection, 'Z 30 STA: 保留读卡会话，跳过自动配对和遥控切换');
       } else {
         await _session.enableAppControl(remoteLatch: true)
             .timeout(_wirelessConnectBudget);

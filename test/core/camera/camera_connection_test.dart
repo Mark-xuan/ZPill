@@ -683,6 +683,33 @@ void main() {
       }
     });
 
+    test('Z 30 STA 首连有配对指令时保留原会话并保存连接地址', () async {
+      final paired = InMemoryPairedCamerasStore();
+      final (conn, _, session, commands, events) = wirePairing(
+        FakeUsbHostChannel(const []),
+        paired: paired,
+        connects: 1,
+      );
+      const ip = '192.168.1.241';
+      final connecting = conn.connect(ip: ip);
+      await scriptHandshakeAndOpen(
+        commands.single,
+        events.single,
+        deviceModel: 'Z 30',
+        deviceInfoOperations: const [0x1001, 0x1002, 0x1003, 0x952B, 0x935A],
+      );
+      await connecting;
+
+      final request = _codec.decode(commands.single.sent.last) as OperationRequestPacket;
+      expect(request.opcode, PtpOperationCode.openSession);
+      expect(conn.state, CameraLinkState.connected);
+      expect(conn.galleryFirst, isTrue);
+      expect(session.isSessionOpen, isTrue);
+      final saved = (await paired.list()).single;
+      expect(saved.lastIp, ip);
+      expect(saved.wirelessPaired, isFalse);
+    });
+
     test('断链(command 通道被关):connected → reconnecting(自动恢复),'
         '实例/USB/路由全收口', () async {
       final usb = FakeUsbHostChannel(const []);

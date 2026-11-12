@@ -96,6 +96,8 @@ STA 模式结论(2026-10-04 真机,相机入家庭网 192.168.0.104):
 from __future__ import annotations
 
 import argparse
+import json
+from pathlib import Path
 import socket
 import struct
 import sys
@@ -188,15 +190,15 @@ def packet(ptype: int, body: bytes = b"") -> bytes:
 NIKON_ANDROID_GUID = bytes.fromhex("00112233445566778899AABBCCDDEEFF")
 PTPIP_VERSION = 0x00010000  # 协议版本 1.0,小端 u32,附在 Init 末尾
 
-def init_command_request(hostname: str) -> bytes:
-    """尼康 Wi-Fi 方言(MTP/IP 布局):GUID(16B 固定值)+ UTF-16LE
+def init_command_request(hostname: str, client_guid: bytes = NIKON_ANDROID_GUID) -> bytes:
+    """尼康 Wi-Fi 方言(MTP/IP 布局):GUID(16B)+ UTF-16LE
     主机名(NUL 结尾,**无长度前缀**)+ u32 协议版本。
 
     规范 PTP/IP 布局(GUID + u32 字节长度 + 主机名)在「连接至智能
     设备」模式下被相机当乱码丢弃(读完即 FIN)—— 见模块 docstring。
     """
     name = (hostname + "\x00").encode("utf-16-le")
-    return packet(INIT_CMD_REQ, NIKON_ANDROID_GUID + name + u32(PTPIP_VERSION))
+    return packet(INIT_CMD_REQ, client_guid + name + u32(PTPIP_VERSION))
 
 def init_event_request(connection_number: int) -> bytes:
     return packet(INIT_EVENT_REQ, u32(connection_number))
@@ -485,6 +487,20 @@ def parse_object_handle(value: str) -> int:
     if not 0 < handle < 0xFFFFFFFF:
         raise argparse.ArgumentTypeError("对象句柄应为有效的 32 位十进制或 0x 十六进制值")
     return handle
+
+
+def load_client_identity(path: str) -> tuple[str, bytes]:
+    """Read the client name and raw GUID written by ClientIdentityStore."""
+    try:
+        identity = json.loads(Path(path).read_text(encoding="utf-8-sig"))
+        name = identity["name"]
+        guid = bytes.fromhex(identity["uuid"])
+        if not isinstance(name, str) or not name or "\0" in name or len(guid) != 16:
+            raise ValueError
+        name.encode("utf-16-le")
+    except (OSError, KeyError, TypeError, ValueError) as error:
+        raise argparse.ArgumentTypeError("无法读取有效的 ZPill client_identity.json") from error
+    return name, guid
 
 
 PTP_DTYPES = {
@@ -785,6 +801,8 @@ def main() -> int:
     ap.add_argument("--port", type=int, default=PORT)
     ap.add_argument("--gallery-handle", type=parse_object_handle, metavar="HANDLE",
                     help="只读图库对照:连接后对指定对象读取元数据、缩略图和 64 KiB 文件头")
+    ap.add_argument("--client-identity", type=load_client_identity, metavar="JSON",
+                    help="图库对照使用本机导出的 ZPill 客户端身份文件")
     gallery_modes = ap.add_mutually_exclusive_group()
     gallery_modes.add_argument("--gallery-compare-remote", action="store_true",
                                help="先读取，再执行遥控模式 1→0，并重复读取")
@@ -837,6 +855,9 @@ def main() -> int:
     args = ap.parse_args()
     if (args.gallery_compare_remote or args.gallery_remote_first) and args.gallery_handle is None:
         ap.error("图库遥控模式对照需要同时指定 --gallery-handle")
+    if args.client_identity is not None and args.gallery_handle is None:
+        ap.error("--client-identity 需要同时指定 --gallery-handle")
+    hostname, client_guid = args.client_identity or (args.hostname, NIKON_ANDROID_GUID)
 
     print(f"[1] 正在连接相机 {args.host}:{args.port}…", flush=True)
     try:
@@ -850,11 +871,11 @@ def main() -> int:
 
     # 步骤 1-2:Init Command Request → Response
     try:
-        cmd.sendall(init_command_request(args.hostname))
+        cmd.sendall(init_command_request(hostname, client_guid))
         ptype, body = read_packet(cmd)
     except (ConnectionError, socket.timeout, OSError) as e:
         print(f"[2] InitCommandRequest 握手失败({e})")
-        print("    已按尼康方言发(固定 GUID + NUL 主机名 + 版本)仍被掐 ——")
+        print("    已按尼康方言发(GUID + NUL 主机名 + 版本)仍被掐 ——")
         print("    请确认相机在「网络 → 连接至智能设备」的等待连接状态;")
         print("    若相机在「连接到计算机」模式,它期待规范 PTP/IP 方言,")
         print("    请切回「连接至智能设备」再试。日志带回给 Claude。")
@@ -866,7 +887,7 @@ def main() -> int:
         if reason == 1:
             print("    相机拒绝新会话。先断开 ZPill、ZRelay 和 SnapBridge，"
                   "再让相机退出并重新进入 Wi-Fi 连接后重试。")
-            print("    若仍被拒，请核对相机的配对对象。探针使用独立的客户端身份。")
+            print("    若仍被拒，请核对相机的配对对象和本次使用的客户端身份。")
         else:
             print("    相机拒绝 PTP/IP 初始化，请核对连接模式和配对状态。")
         return 1

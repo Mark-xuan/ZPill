@@ -27,6 +27,15 @@ python tools/ptpip_probe/probe.py <相机IP> --gallery-handle 689504361
 
 用 `--gallery-remote-first` 可在 `OpenSession` 成功后立即切换遥控模式，再读取同一个对象，核对 ZPill 的连接顺序。两个对照选项互斥。
 
+要在同一台电脑上对照默认探针身份与已配对的 ZPill 身份，可从自己的 Android Debug 版本导出身份文件。以下命令在 Windows CMD 执行，手机需已通过 ADB 授权。品牌定制构建请替换包名。
+
+```cmd
+adb exec-out run-as com.jaminxx.zpill cat files/zpill-data/client_identity.json > "%TEMP%\zpill-client-identity.json"
+python tools/ptpip_probe/probe.py 192.168.1.241 --gallery-handle 689504361 --client-identity "%TEMP%\zpill-client-identity.json"
+```
+
+用同一个相机 IP 和句柄，省略 `--client-identity` 再做一轮对照。开始前先断开手机 App 占用的相机会话。身份文件只留本机，分享探针输出即可。
+
 ## 当前覆盖
 
 - [x] command 通道 TCP 连接 + InitCommandRequest/Response
