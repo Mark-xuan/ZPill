@@ -34,6 +34,26 @@ jobs:
       - name: Install dependencies
         run: flutter pub get
 
+      - name: Exclude the HarmonyOS-only video view from the Android build
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          source = Path('lib/platform/video_player.dart')
+          text = source.read_text(encoding='utf-8')
+          harmony_view = (
+              "  if (Platform.operatingSystem == 'ohos') {\n"
+              "    return OhosView(\n"
+              "      viewType: 'zpill/video-view',\n"
+              "      onPlatformViewCreated: onCreated,\n"
+              "    );\n"
+              "  }\n"
+          )
+          if text.count(harmony_view) != 1:
+              raise SystemExit('Expected one HarmonyOS video view branch in video_player.dart')
+          source.write_text(text.replace(harmony_view, ''), encoding='utf-8')
+          PY
+
       - name: Build debug APK
         run: flutter build apk --debug
 
