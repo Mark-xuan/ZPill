@@ -152,7 +152,10 @@ final class AppServices {
   /// 浏览/传输装配:仓库 → 文件操作 → 评分 → 下载器 → 缩略缓存 →
   /// 传输引擎(水印/XMP 注入闭包)→ 速传 → 设置与快照。
   void _wireBrowseAndTransfer() {
-    repository = ObjectRepositoryImpl(session: session);
+    repository = ObjectRepositoryImpl(
+      session: session,
+      allowJpegReadFallback: () => connection.isZ30Sta,
+    );
     fileOps = CameraFileOps(session: session, repository: repository);
     ratingsStore = FileRatingsStore(dataDir: PlatformServices.gallery.dataDir);
     // 弹层选项持久化(排序/筛选/显示/视图;文件夹不入账,句柄随相机漂移)。

@@ -13,6 +13,7 @@ final class ObjectEntry {
     this.capturedAt,
     this.formatCode,
     this.protectionStatus = 0,
+    this.requiresExtendedRead = false,
   });
 
   /// 只能来自 GetObjectHandles 响应。
@@ -32,6 +33,7 @@ final class ObjectEntry {
   /// 相册列表的真值来源(重列即新);查看器保护态 = 会话乐观 Map 优先、
   /// 此字段兜底(2026-10-16 接线)。
   final int protectionStatus;
+  final bool requiresExtendedRead;
 
   bool get isFolder => kind == ObjectKind.folder;
   bool get isProtected => protectionStatus == 1;
@@ -44,5 +46,7 @@ final class ObjectEntry {
         parentHandle: parentHandle,
         capturedAt: capturedAt ?? this.capturedAt,
         formatCode: formatCode,
+        protectionStatus: protectionStatus,
+        requiresExtendedRead: requiresExtendedRead,
       );
 }

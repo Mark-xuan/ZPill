@@ -284,8 +284,7 @@ final class CameraConnectionImpl implements CameraConnection {
   @override
   String? get deviceModel => _deviceModel;
 
-  /// Z 30 的 STA 会话先保留读卡能力，进入拍摄时再开启取景。
-  bool get galleryFirst => _lastGood?.rememberIp == true && _isZ30(_deviceModel);
+  bool get isZ30Sta => _lastGood?.rememberIp == true && _isZ30(_deviceModel);
 
   static bool _isZ30(String? model) {
     final normalized = model?.toUpperCase().replaceAll(RegExp(r'\s+'), '');
@@ -413,7 +412,10 @@ final class CameraConnectionImpl implements CameraConnection {
   /// 异常抛回),由调用方的循环节拍决定去留 —— 整个等待窗保持
   /// connecting 态安静重试,不闪失败横幅。
   Future<void> _connectWireless(String ip,
-      {String? instanceName, bool silent = false, bool rememberIp = true}) async {
+      {String? instanceName,
+      bool silent = false,
+      bool rememberIp = true,
+      bool pairingJustCompleted = false}) async {
     await _awaitTeardown();
     final transport = await _createIpTransport();
     // 先登记:握手/会话任一步失败,catch 里的 teardown 都能收尾实例
@@ -432,10 +434,15 @@ final class CameraConnectionImpl implements CameraConnection {
       // Zf)。USB 路无实例名,同样拼装(见 _openSessionOrReject 沿)。
       _deviceName = _deviceLabel(info, instanceName);
       _deviceModel = info.model;
-      // Z 30 通过 STA 可在初始会话读卡。完成配对后的重连曾切到
-      // 设备信息不同且拒绝读卡的状态，图库连接保留初始会话。
-      final galleryFirst = rememberIp && _isZ30(info.model);
-      if (!galleryFirst && await _needsPairing(info)) {
+      // Z 30 STA 的初始会话可读卡，但机身仍可能停在等待配对界面。
+      // 相机只报告配对能力时，即使本地有历史配对记录也向机身取码。
+      final checkZ30Pairing = rememberIp &&
+          _isZ30(info.model) &&
+          info.supportsOperation(NikonOperationCode.getPtpIpPairingCode) &&
+          info.supportsOperation(NikonOperationCode.completePairing) &&
+          !info.supportsOperation(PtpOperationCode.getObjectHandles);
+      if (!pairingJustCompleted &&
+          await _needsPairing(info, checkCamera: checkZ30Pairing)) {
         switch (await _runPairing(info, ip, instanceName,
             rememberIp: rememberIp)) {
           case _PairResult.newlyPaired:
@@ -453,7 +460,8 @@ final class CameraConnectionImpl implements CameraConnection {
                 await _connectWireless(ip,
                     instanceName: instanceName,
                     silent: true,
-                    rememberIp: rememberIp);
+                    rememberIp: rememberIp,
+                    pairingJustCompleted: true);
                 return; // connected(或外部收口后的任意态)
               } on Exception catch (e) {
                 if (attempt >= _postPairingRetryDelays.length) {
@@ -484,14 +492,8 @@ final class CameraConnectionImpl implements CameraConnection {
       // 对 op 死寂的半哑态,旧路径 0x9435 挂满 15s 看门狗后还会带毒转
       // connected(链路已毒、状态机报连上,真机 2026-10-08「上次」连接
       // 很久的场景之一)—— 预算内收不掉就按「连接超时」failed 收口。
-      // STA 的 Z 30 已在真机复现：直接读卡正常，0x90C2(1) 后相机断开。
-      // STA 保存可复用地址，AP 调用以 rememberIp: false 保留原有遥控路径。
-      if (galleryFirst) {
-        AppLog.i(AppLog.connection, 'Z 30 STA: 保留读卡会话，跳过自动配对和遥控切换');
-      } else {
-        await _session.enableAppControl(remoteLatch: true)
-            .timeout(_wirelessConnectBudget);
-      }
+      await _session.enableAppControl(remoteLatch: true)
+          .timeout(_wirelessConnectBudget);
       // 连接档案落账(不管相机侧配对是否完成):扫描出的 IP/展示名进
       // 快速重连列表 —— STA「连接至计算机」模式相机不答 0x952B,旧
       // 逻辑只配对成功才落账 → 该模式永远存不下来(2026-10-06 真机
@@ -593,9 +595,11 @@ final class CameraConnectionImpl implements CameraConnection {
     return _PairResult.newlyPaired;
   }
 
-  Future<bool> _needsPairing(PtpDeviceInfo info) async {
+  Future<bool> _needsPairing(PtpDeviceInfo info,
+      {required bool checkCamera}) async {
     final store = _pairedCameras;
     if (store == null) return false;
+    if (checkCamera) return true;
     final id = _cameraId(info);
     // 只认 wirelessPaired(相机侧已完成 0x935A):STA「连接至计算机」
     // 模式相机不答配对 op,应用侧虽已记住(连接即落账),相机侧没

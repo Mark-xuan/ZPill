@@ -12,6 +12,7 @@ import '../ptp/ptp_transport.dart';
 import '../log/app_log.dart';
 import '../media/video_rating.dart';
 import '../media/video_duration.dart';
+import '../media/watermark.dart' show exifCardFromHead;
 import '../utils/byte_reader.dart';
 import '../utils/byte_writer.dart';
 import 'album.dart';
@@ -237,7 +238,11 @@ abstract interface class ObjectRepository {
 /// 会话关闭/重连后必须 [reset](AppServices 订阅连接状态驱动),否则句柄
 /// 可能已过期。
 final class ObjectRepositoryImpl implements ObjectRepository {
-  ObjectRepositoryImpl({required this.session, this.chunkSize = 24}) {
+  ObjectRepositoryImpl({
+    required this.session,
+    this.chunkSize = 24,
+    this.allowJpegReadFallback,
+  }) {
     // 拍照即现身:相机落卡 → ObjectAdded(0x4002,中断通道与 0x941C
     // 轮询均汇入 session.events)→ 拉该对象 ObjectInfo 入缓存并广播,
     // 相册免手动刷新(2026-10-16 用户复报「拍的照片要刷新才出现」;
@@ -259,9 +264,10 @@ final class ObjectRepositoryImpl implements ObjectRepository {
     final gen = _generation;
     unawaited(() async {
       try {
-        final info = await session.getObjectInfo(handle);
+        final entry = await _readEntry(handle);
+        if (entry == null) return;
         if (gen != _generation) return; // reset 竞态:弃
-        _byHandle[handle] = ObjectRepository.toEntry(info);
+        _byHandle[handle] = entry;
         _groupIndexOf = null;
         _albumsCache = null;
         // 枚举进行中不另发布(其分块广播读活缓存,新对象自然带上);
@@ -276,6 +282,7 @@ final class ObjectRepositoryImpl implements ObjectRepository {
   }
 
   final PtpSession session;
+  final bool Function()? allowJpegReadFallback;
 
   /// 0x4007 ObjectInfoChanged(§6.4.1.7):对象信息变化(相机侧改评是
   /// 其一;是否真发未证)。best-effort 重拉该对象评级 —— 相机→App
@@ -743,6 +750,45 @@ final class ObjectRepositoryImpl implements ObjectRepository {
     });
   }
 
+  Future<ObjectEntry?> _readEntry(int handle) async {
+    try {
+      return ObjectRepository.toEntry(await session.getObjectInfo(handle));
+    } on PtpResponseException catch (error) {
+      if (error.responseCode != PtpResponseCode.accessDenied ||
+          allowJpegReadFallback?.call() != true) {
+        rethrow;
+      }
+      final int size;
+      try {
+        size = await session.getObjectSize(handle);
+      } on PtpResponseException catch (error) {
+        // GetObjectHandles also includes directories, which have no file size.
+        if (error.responseCode == PtpResponseCode.invalidParameter) return null;
+        rethrow;
+      }
+      if (size <= 0) return null;
+      final head =
+          await session.getPartialObjectEx(handle, 0, math.min(size, 4096));
+      if (head.length < 3 ||
+          head[0] != 0xFF ||
+          head[1] != 0xD8 ||
+          head[2] != 0xFF) {
+        return null;
+      }
+      final serial = session.cachedDeviceInfo?.serialNumber ?? 'camera';
+      final label = serial.replaceAll(RegExp(r'[^A-Za-z0-9_-]'), '_');
+      return ObjectEntry(
+        handle: handle,
+        name: 'Z30_${label}_${handle.toRadixString(16)}.JPG',
+        sizeInBytes: size,
+        kind: ObjectKind.image,
+        formatCode: ObjectFormatCode.exifJpeg,
+        capturedAt: exifCardFromHead(head)?.takenAt,
+        requiresExtendedRead: true,
+      );
+    }
+  }
+
   /// 全量枚举(渐进,分页快路):GetObjectHandles(Zf 语义 parent=0)
   /// 全量句柄 → 根层逐根 0x9805 depth=1 探日期目录 → 目录按名降序逐页
   /// 0x9805 depth=1(页 = 日期目录),每页合并入缓存即广播,页间留
@@ -855,9 +901,9 @@ final class ObjectRepositoryImpl implements ObjectRepository {
       final end = math.min(start + chunkSize, gaps.length);
       for (var i = start; i < end; i++) {
         final handle = gaps[i];
-        final PtpObjectInfo info;
+        final ObjectEntry? entry;
         try {
-          info = await session.getObjectInfo(handle);
+          entry = await _readEntry(handle);
         } on PtpResponseException {
           // 相机明确拒答单个对象(如同刻被删):跳过继续;连续 3 个失败
           // 视为会话级拒绝,上抛终止本轮(防空转数百次)。传输层/看门狗
@@ -869,10 +915,15 @@ final class ObjectRepositoryImpl implements ObjectRepository {
         }
         consecutiveFailures = 0;
         if (generation != _generation) return; // 每个 await 后、写缓存前
-        _byHandle[handle] = ObjectRepository.toEntry(info);
-        _groupIndexOf = null;
-        _albumsCache = null;
         loaded++;
+        if (entry != null) {
+          _byHandle[handle] = entry;
+          _groupIndexOf = null;
+          _albumsCache = null;
+          if (entry.requiresExtendedRead && loaded == 1) {
+            _publish(loaded, ordered.length, complete: false);
+          }
+        }
       }
       if (generation != _generation) return;
       _publish(loaded, ordered.length, complete: false);
@@ -884,7 +935,9 @@ final class ObjectRepositoryImpl implements ObjectRepository {
     // 评级同步:0x9434 批量位一发拿全卡「有无星」(SnapBridge 同款
     // 通道,NEF 也在内),有星的适用格式再逐张 0x9803 拉档位 ——
     // 无星的绝大多数对象零事务(不 await,不挡本 Future)。
-    unawaited(_syncRatingsViaMeta(generation));
+    if (!_byHandle.values.any((entry) => entry.requiresExtendedRead)) {
+      unawaited(_syncRatingsViaMeta(generation));
+    }
   }
 
   /// 评级主同步路:0x9434 位图 → 逐张档位补拉。起步延 500ms(枚举沿

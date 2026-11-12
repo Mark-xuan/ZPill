@@ -69,6 +69,18 @@ mixin _BrowseOps on _SessionCore {
         handle: handle, dataset: _requireData(result, 'GetObjectInfo'));
   }
 
+  /// Nikon GetObjectSize (0x9421) returns the size as a little-endian u64.
+  Future<int> getObjectSize(int handle) async {
+    final result = await _serialized(() => transport.execute(PtpRequest(
+          opcode: NikonOperationCode.getObjectSize,
+          params: [handle],
+        )));
+    _ensureOk(result, NikonOperationCode.getObjectSize);
+    final data = _requireData(result, 'GetObjectSize');
+    if (data.length != 8) throw const FormatException('Invalid GetObjectSize data');
+    return ByteReader(data).u64();
+  }
+
   /// DeleteObject(0x100B,标准码):删除相机上的单个对象。
   ///
   /// RAW+JPG 合并组按成员逐个删;被删对象由仓库层出缓存

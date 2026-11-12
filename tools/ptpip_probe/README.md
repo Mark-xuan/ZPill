@@ -36,6 +36,19 @@ python tools/ptpip_probe/probe.py 192.168.1.241 --gallery-handle 689504361 --cli
 
 用同一个相机 IP 和句柄，省略 `--client-identity` 再做一轮对照。开始前先断开手机 App 占用的相机会话。身份文件只留本机，分享探针输出即可。
 
+### 配对完成后读取图库
+
+相机已加入同一网络并处于等待配对时，用导出的 ZPill 身份请求配对。相机显示配对完成后，在机身按 J／OK，然后执行第二条命令。两条命令之间保持相机联网并让手机 App 断开。第二条命令在新的会话中直接读图库。
+
+```cmd
+python tools/ptpip_probe/probe.py 192.168.1.241 --gallery-pair --client-identity "%TEMP%\zpill-client-identity.json"
+python tools/ptpip_probe/probe.py 192.168.1.241 --gallery-handle 689504361 --client-identity "%TEMP%\zpill-client-identity.json"
+```
+
+`--gallery-pair` 会在相机上配对该客户端。第二条命令还会记录逐属性读取 `0x9803`、文件大小 `0x9421` 和尼康分块读取 `0x9431` 的响应，用于验证配对后能否读取列表所需的字段和图片数据。
+
+若 `0x9421` 和 `0x9431` 成功，可在第二条命令末尾加 `--gallery-download-jpeg "%TEMP%\z30-sta-test.jpg"`。探针会按相机返回的大小分块读取整张 JPEG，并核对文件头和结束标记。目标文件需为新文件，失败会清理本次下载的部分数据。
+
 ## 当前覆盖
 
 - [x] command 通道 TCP 连接 + InitCommandRequest/Response

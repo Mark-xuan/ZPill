@@ -237,7 +237,7 @@ final class RemoteController extends ChangeNotifier
           // 上次断链时还持有 remote 模式:防御性解除(机身拨盘可能仍
           // 锁定,OpenZCine 同款「photo 模式重入先复位」口径)。
           _takeoverDangling = false;
-          if (!galleryFirst) unawaited(_endRemoteModeQuietly());
+          unawaited(_endRemoteModeQuietly());
         }
         unawaited(_onConnectedChain());
       } else if (s == CameraLinkState.reconnecting) {

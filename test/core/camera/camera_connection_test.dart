@@ -664,50 +664,46 @@ void main() {
       expect(session.isSessionOpen, isTrue);
     });
 
-    test('Z 30 STA 保留读卡会话，AP 仍执行遥控模式切换', () async {
-      for (final sta in [true, false]) {
-        final usb = FakeUsbHostChannel(const []);
-        final (conn, _, session, command, event, _) = wireWireless(usb);
-        final connecting = conn.connect(ip: '192.168.1.241', rememberIp: sta);
-        await scriptHandshakeAndOpen(command, event, deviceModel: 'Z 30');
-        if (!sta) await scriptAppMode(command);
-        await connecting;
-
-        final lastRequest = _codec.decode(command.sent.last) as OperationRequestPacket;
-        expect(lastRequest.opcode, sta
-            ? PtpOperationCode.openSession
-            : NikonOperationCode.changeCameraMode);
-        expect(conn.state, CameraLinkState.connected);
-        expect(conn.galleryFirst, sta);
-        expect(session.isSessionOpen, isTrue);
-      }
-    });
-
-    test('Z 30 STA 首连有配对指令时保留原会话并保存连接地址', () async {
+    test('Z 30 STA 机身等待配对时复核历史档案，配对完成后启动遥控', () async {
       final paired = InMemoryPairedCamerasStore();
+      const ip = '192.168.1.241';
+      await paired.save(const CameraInfo(
+        id: '12345678901',
+        name: 'Z 30',
+        model: 'Z 30',
+        lastIp: ip,
+        wirelessPaired: true,
+      ));
       final (conn, _, session, commands, events) = wirePairing(
         FakeUsbHostChannel(const []),
         paired: paired,
-        connects: 1,
       );
-      const ip = '192.168.1.241';
+      const pairingOps = [0x1001, 0x1002, 0x1003, 0x952B, 0x935A];
       final connecting = conn.connect(ip: ip);
       await scriptHandshakeAndOpen(
-        commands.single,
-        events.single,
+        commands[0],
+        events[0],
         deviceModel: 'Z 30',
-        deviceInfoOperations: const [0x1001, 0x1002, 0x1003, 0x952B, 0x935A],
+        deviceInfoOperations: pairingOps,
       );
+      await scriptPairingCode(commands[0]);
+      expect(conn.state, CameraLinkState.pairing);
+
+      await conn.confirmPairing();
+      await scriptCompletePairing(commands[0]);
+      commands[0].emitClosed();
+      await scriptHandshakeAndOpen(
+        commands[1],
+        events[1],
+        deviceModel: 'Z 30',
+        deviceInfoOperations: pairingOps,
+      );
+      await scriptAppMode(commands[1]);
       await connecting;
 
-      final request = _codec.decode(commands.single.sent.last) as OperationRequestPacket;
-      expect(request.opcode, PtpOperationCode.openSession);
       expect(conn.state, CameraLinkState.connected);
-      expect(conn.galleryFirst, isTrue);
       expect(session.isSessionOpen, isTrue);
-      final saved = (await paired.list()).single;
-      expect(saved.lastIp, ip);
-      expect(saved.wirelessPaired, isFalse);
+      expect((await paired.list()).single.wirelessPaired, isTrue);
     });
 
     test('断链(command 通道被关):connected → reconnecting(自动恢复),'

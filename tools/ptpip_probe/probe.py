@@ -146,6 +146,8 @@ NIKON_GET_LIVEVIEW_IMG_EX = 0x9428  # OpenZCine 全系取帧码(ZR dump 实证�
 NIKON_CHANGE_AF_AREA = 0x9205  # p1/p2 = whole-size 坐标(OpenZCine PTPIPClientSession)
 NIKON_AF_DRIVE = 0x90C1
 NIKON_CHANGE_CAMERA_MODE = 0x90C2
+NIKON_GET_PAIRING_CODE = 0x952B
+NIKON_COMPLETE_PAIRING = 0x935A
 NIKON_CHANGE_APPLICATION_MODE = 0x9435  # Z 系方言:遥控 op 前须切应用模式(app enableAppControl 同款)
 NIKON_DEVICE_READY = 0x90C8
 NIKON_GET_PICTCTRL_DATA = 0x90CC  # 优化校准槽位详情:params[槽位,0],name=数据[2..22) ASCII(官方 §9.9:BasePictureControl 2B + RegistrationName 20B;[3..23) 是 digiCamControl 旧机型口径,会吞首字母)
@@ -449,6 +451,27 @@ def gallery_remote_cycle(cmd: socket.socket, tid: Tid) -> bool:
     return all(code == PTP_OK for code in codes)
 
 
+def pair_gallery_client(cmd: socket.socket, tid: Tid) -> int:
+    """Request pairing using the supplied ZPill identity."""
+    _, data, _, (code, _, _) = cmd_xact(cmd, tid, NIKON_GET_PAIRING_CODE)
+    print(f"GetPtpIpPairingCode (0x952B) <- 0x{code:04X}")
+    count = struct.unpack_from("<I", data)[0] if len(data) >= 4 else 0
+    if code != PTP_OK or not 0 < count <= len(data) - 4:
+        print("相机没有返回有效配对码，未发送配对确认。")
+        return 1
+    try:
+        _, _, _, (code, _, _) = cmd_xact(
+            cmd, tid, NIKON_COMPLETE_PAIRING, [PTP_OK], dp=DP_NO_DATA)
+    except ConnectionError:
+        print("配对确认发出后相机断开，请检查机身是否显示配对完成。")
+        return 1
+    print(f"CompletePairing (0x935A) <- 0x{code:04X}")
+    if code != PTP_OK:
+        return 1
+    print("相机已应答配对确认。机身显示配对完成后，按 J，再运行读卡对照。")
+    return 0
+
+
 def probe_gallery_object(cmd: socket.socket, tid: Tid, handle: int) -> int:
     """Compare read operations on one existing card object in a fresh session."""
     _, payload, _, (code, _, _) = cmd_xact(
@@ -470,6 +493,10 @@ def probe_gallery_object(cmd: socket.socket, tid: Tid, handle: int) -> int:
     operations = (
         (GET_OBJECT_INFO, "GetObjectInfo", [handle]),
         (0x9805, "GetObjectPropList", [handle, 0, 0xFFFFFFFF, 0, 0]),
+        (0x9803, "GetObjectPropValue(Filename)", [handle, 0xDC07]),
+        (0x9803, "GetObjectPropValue(Format)", [handle, 0xDC02]),
+        (0x9803, "GetObjectPropValue(Size)", [handle, 0xDC04]),
+        (0x9421, "GetObjectSize", [handle]),
         (GET_THUMB, "GetThumb", [handle]),
         (0x90C4, "GetLargeThumb", [handle]),
         (0x101B, "GetPartialObject", [handle, 0, 65536]),
@@ -480,6 +507,41 @@ def probe_gallery_object(cmd: socket.socket, tid: Tid, handle: int) -> int:
         print(f"{name} (0x{opcode:04X}) 0x{handle:08X} <- 0x{code:04X}, "
               f"{len(data)}B, 头部={data[:8].hex().upper() or '-'}")
     return 0
+
+
+def download_gallery_jpeg(cmd: socket.socket, tid: Tid, handle: int, target: Path) -> None:
+    """Read a complete JPEG using the commands verified on the paired Z 30."""
+    _, data, _, (code, _, _) = cmd_xact(cmd, tid, 0x9421, [handle])
+    if code != PTP_OK or len(data) != 8:
+        raise ProtocolError(f"GetObjectSize (0x9421) 返回 0x{code:04X}，数据 {len(data)}B")
+    size = struct.unpack("<Q", data)[0]
+    if size < 4:
+        raise ProtocolError(f"JPEG 文件大小无效: {size}B")
+
+    with target.open("xb") as output:
+        try:
+            offset = 0
+            tail = b""
+            while offset < size:
+                want = min(65536, size - offset)
+                params = [handle, offset & 0xFFFFFFFF, offset >> 32, want, 0]
+                _, chunk, _, (code, _, _) = cmd_xact(cmd, tid, 0x9431, params)
+                if code != PTP_OK or not 0 < len(chunk) <= want:
+                    raise ProtocolError(f"GetPartialObjectEx (0x9431) offset={offset} "
+                                        f"返回 0x{code:04X}，数据 {len(chunk)}B")
+                if offset == 0 and not chunk.startswith(b"\xff\xd8"):
+                    raise ProtocolError("文件头不是 JPEG")
+                output.write(chunk)
+                tail = (tail + chunk[-2:])[-2:]
+                offset += len(chunk)
+            if tail != b"\xff\xd9":
+                raise ProtocolError("读取达到对象大小，但文件末尾没有 JPEG 结束标记")
+            output.flush()
+        except BaseException:
+            output.close()
+            target.unlink()
+            raise
+    print(f"已保存 JPEG: {target}，{size}B（与相机报告的对象大小一致）")
 
 
 def parse_object_handle(value: str) -> int:
@@ -803,11 +865,15 @@ def main() -> int:
                     help="只读图库对照:连接后对指定对象读取元数据、缩略图和 64 KiB 文件头")
     ap.add_argument("--client-identity", type=load_client_identity, metavar="JSON",
                     help="图库对照使用本机导出的 ZPill 客户端身份文件")
+    ap.add_argument("--gallery-download-jpeg", type=Path, metavar="PATH",
+                    help="图库对照后用 0x9421 和 0x9431 保存一张完整 JPEG")
     gallery_modes = ap.add_mutually_exclusive_group()
     gallery_modes.add_argument("--gallery-compare-remote", action="store_true",
                                help="先读取，再执行遥控模式 1→0，并重复读取")
     gallery_modes.add_argument("--gallery-remote-first", action="store_true",
                                help="刚开会话就执行遥控模式 1→0，再读取图库")
+    gallery_modes.add_argument("--gallery-pair", action="store_true",
+                               help="使用 ZPill 身份请求配对，随后退出以便做配对后的读卡对照")
     ap.add_argument("--hostname", default="Android Device",
                     help="InitCommandReq 主机名(尼康方言默认 Android Device,Camera_Bridge 实证值)")
     ap.add_argument("--idle", type=int, default=0, metavar="SECONDS",
@@ -855,8 +921,12 @@ def main() -> int:
     args = ap.parse_args()
     if (args.gallery_compare_remote or args.gallery_remote_first) and args.gallery_handle is None:
         ap.error("图库遥控模式对照需要同时指定 --gallery-handle")
-    if args.client_identity is not None and args.gallery_handle is None:
-        ap.error("--client-identity 需要同时指定 --gallery-handle")
+    if args.gallery_pair and (args.client_identity is None or args.gallery_handle is not None):
+        ap.error("--gallery-pair 需要 --client-identity，请分两次运行配对和 --gallery-handle")
+    if args.client_identity is not None and args.gallery_handle is None and not args.gallery_pair:
+        ap.error("--client-identity 需要同时指定 --gallery-handle 或 --gallery-pair")
+    if args.gallery_download_jpeg is not None and args.gallery_handle is None:
+        ap.error("--gallery-download-jpeg 需要同时指定 --gallery-handle")
     hostname, client_guid = args.client_identity or (args.hostname, NIKON_ANDROID_GUID)
 
     print(f"[1] 正在连接相机 {args.host}:{args.port}…", flush=True)
@@ -941,6 +1011,14 @@ def main() -> int:
         print(f"[5] OpenSession 失败:0x{code:04X}")
         return 1
 
+    if args.gallery_pair:
+        with cmd, evt:
+            try:
+                return pair_gallery_client(cmd, tid)
+            except (OSError, ProtocolError) as error:
+                print(f"配对对照中止: {error}")
+                return 1
+
     if args.gallery_handle is not None:
         with cmd, evt:
             try:
@@ -960,6 +1038,8 @@ def main() -> int:
                     else:
                         print("遥控模式切换未完整成功，无法比较切换前后")
                         result = 1
+                if args.gallery_download_jpeg is not None and result == 0:
+                    download_gallery_jpeg(cmd, tid, args.gallery_handle, args.gallery_download_jpeg)
                 _, _, _, (code, _, _) = cmd_xact(
                     cmd, tid, CLOSE_SESSION, dp=DP_NO_DATA)
                 print(f"CloseSession <- 0x{code:04X}")

@@ -240,7 +240,8 @@ class ObjectDownloader {
     var paused = false;
     var chunked = false;
     try {
-      chunked = partialChunkBytes != null && await _partialReadable();
+      chunked = entry.requiresExtendedRead ||
+          (partialChunkBytes != null && await _partialReadable());
       // 大档 + 可取消:整档排空不可接受,改走分块(见字段注)。相机
       // 不支持 0x101B 时回落整档,行为与旧版一致。
       if (!chunked &&
@@ -280,9 +281,11 @@ class ObjectDownloader {
             paused = true; // 块界暂停:半成品保留,resume 从 offset 续
             break;
           }
-          final useEx = _enablePartialObjectEx && (_exUsable ?? true);
+          final useEx = entry.requiresExtendedRead ||
+              (_enablePartialObjectEx && (_exUsable ?? true));
           final policy = useEx ? _exPolicy : _chunkPolicy;
-          var want = math.min(policy.currentBytes, entry.sizeInBytes - offset);
+          final chunkBytes = entry.requiresExtendedRead ? 65536 : policy.currentBytes;
+          var want = math.min(chunkBytes, entry.sizeInBytes - offset);
           // 外部块闸(取景在场保帧,见 [_chunkCap]):只钳本块请求,
           // 不喂策略 —— AIMD 演化照常,闸撤即回策略块。
           final cap = _chunkCap?.call();
@@ -295,7 +298,7 @@ class ObjectDownloader {
                     .getPartialObjectEx(entry.handle, offset, want)
                 : await _session.getPartialObject(entry.handle, offset, want);
           } on PtpResponseException catch (e) {
-            if (useEx && _isExUnsupported(e)) {
+            if (useEx && !entry.requiresExtendedRead && _isExUnsupported(e)) {
               // 能力拒绝(0x2005/0x2006):≠ 链路信号,不喂策略;本会话
               // 降级 0x101B,本块原样重发(continue 不推进 offset,
               // 降级后 useEx 恒假,无循环风险)。

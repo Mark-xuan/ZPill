@@ -16,6 +16,30 @@ library;
 
 import 'dart:typed_data';
 
+import 'package:image/image.dart' as img;
+
+/// Extract an embedded EXIF thumbnail from the available JPEG header bytes.
+Uint8List? jpegEmbeddedThumbnail(Uint8List head) {
+  final span = _findExifApp1(head);
+  if (span == null) return null;
+  try {
+    final tiff = Uint8List.sublistView(head, span.$1, span.$2);
+    final exif = img.ExifData.fromInputBuffer(img.InputBuffer(tiff));
+    final thumbnail = exif.thumbnailData;
+    if (thumbnail == null || thumbnail.length < 4 ||
+        thumbnail[0] != 0xFF || thumbnail[1] != 0xD8 ||
+        thumbnail[thumbnail.length - 2] != 0xFF ||
+        thumbnail.last != 0xD9) {
+      return null;
+    }
+    return injectJpegOrientation(thumbnail, jpegExifOrientation(head));
+  } on Exception {
+    return null;
+  } on RangeError {
+    return null;
+  }
+}
+
 /// JPEG 是否带 Exif APP1 段(带方向的缩略交给引擎,不再注入)。
 bool jpegHasExif(Uint8List jpeg) => _findExifApp1(jpeg) != null;
 

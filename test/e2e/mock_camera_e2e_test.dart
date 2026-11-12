@@ -10,11 +10,13 @@
 /// OpenSession → 0x90C2 括号),不引入 USB/配对依赖。
 library;
 
+import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:image/image.dart' as img;
 
+import 'package:z_pill/core/browser/object_repository.dart';
 import 'package:z_pill/core/ptp/operation_codes.dart';
 import 'package:z_pill/core/ptp/ptp_link_router.dart';
 import 'package:z_pill/core/ptp/ptp_session.dart';
@@ -22,6 +24,7 @@ import 'package:z_pill/core/ptp/ptp_transport.dart';
 import 'package:z_pill/core/ptpip/codec.dart';
 import 'package:z_pill/core/ptpip/transport.dart';
 import 'package:z_pill/core/ptpip/object_format.dart';
+import 'package:z_pill/core/transfer/object_downloader.dart';
 
 import '../../tools/mock_camera/mock_camera.dart';
 
@@ -248,6 +251,33 @@ void main() {
       expect(await live.session.getObjectHandles(), contains(_jpgHandle));
       await expectLater(live.session.getObjectInfo(_jpgHandle),
           throwsA(accessDenied));
+    });
+
+    test('Z30 STA: 配对会话拒绝标准读卡时列出并完整下载 JPEG', () async {
+      final camera = await _boot(deniedOperations: {
+        NikonOperationCode.getObjectPropList,
+        PtpOperationCode.getObjectInfo,
+        PtpOperationCode.getObject,
+        PtpOperationCode.getPartialObject,
+      });
+      final live = await _connectAndOpen(camera);
+      final repository = ObjectRepositoryImpl(
+        session: live.session,
+        allowJpegReadFallback: () => true,
+      );
+      final albums = await repository.loadAlbums();
+      final entry = await repository.entryFor(_jpgHandle);
+      expect(entry, isNotNull);
+      expect(entry!.requiresExtendedRead, isTrue);
+      expect(albums.first.items.expand((group) => group.members)
+          .map((member) => member.handle), isNot(contains(_nefHandle)));
+      final dir = await Directory.systemTemp.createTemp('z30-sta-download-');
+      addTearDown(() => dir.delete(recursive: true));
+      final download = await ObjectDownloader(session: live.session)
+          .download(entry, targetDir: dir.path);
+      expect(await File(download.path).readAsBytes(), camera.device.object(_jpgHandle)!.body);
+      expect(camera.device.opCounts[PtpOperationCode.getObject], isNull);
+      expect(camera.device.opCounts[PtpOperationCode.getPartialObject], isNull);
     });
 
     test('缩略字节:GetThumb / 0x90C4 与 mock 合成逐字节一致且真可解码',

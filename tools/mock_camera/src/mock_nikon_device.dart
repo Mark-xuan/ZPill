@@ -185,6 +185,20 @@ final class MockNikonDevice {
         return const MockPtpReply(code: PtpResponseCode.ok);
       case PtpOperationCode.getPartialObject:
         return _partialObject(params);
+      case NikonOperationCode.getObjectSize:
+        final o = object(params.isEmpty ? -1 : params.first);
+        if (o == null || o.isFolder) {
+          return const MockPtpReply(code: PtpResponseCode.invalidParameter);
+        }
+        return MockPtpReply(
+          code: PtpResponseCode.ok,
+          data: (ByteWriter()..u64(o.body.length)).takeBytes(),
+        );
+      case NikonOperationCode.getPartialObjectEx:
+        if (params.length != 5 || params[3] == 0 || params[4] != 0) {
+          return const MockPtpReply(code: PtpResponseCode.invalidParameter);
+        }
+        return _partialObject([params[0], params[1] | (params[2] << 32), params[3]]);
       case NikonOperationCode.changeCameraMode:
         cameraMode = params.isEmpty ? 0 : params[0];
         return const MockPtpReply(code: PtpResponseCode.ok);
