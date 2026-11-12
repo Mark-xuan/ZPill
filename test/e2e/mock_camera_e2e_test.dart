@@ -40,9 +40,10 @@ final class _Live {
   final PtpSession session;
 }
 
-Future<MockPtpIpCamera> _boot({int? initFailReason}) async {
+Future<MockPtpIpCamera> _boot(
+    {int? initFailReason, Set<int> deniedOperations = const {}}) async {
   final camera = MockPtpIpCamera(
-    device: MockNikonDevice(objects: _persona),
+    device: MockNikonDevice(objects: _persona, deniedOperations: deniedOperations),
     initFailReason: initFailReason,
   );
   await camera.start(); // 随机口,免冲突
@@ -220,6 +221,33 @@ void main() {
       expect(nef.objectFormat, ObjectFormatCode.undefined);
       final mov = await live.session.getObjectInfo(0x00010004);
       expect(mov.objectFormat, ObjectFormatCode.mp4);
+    });
+
+    test('Z30 STA: 枚举成功，接管后读对象信息仍被拒绝', () async {
+      final camera = await _boot(deniedOperations: {
+        NikonOperationCode.getObjectPropList,
+        PtpOperationCode.getObjectInfo,
+        PtpOperationCode.getPartialObject,
+      });
+      final live = await _connectAndOpen(camera);
+
+      expect(await live.session.getObjectHandles(), contains(_jpgHandle));
+      const denied = PtpResponseCode.accessDenied;
+      final accessDenied = isA<PtpResponseException>()
+          .having((error) => error.responseCode, 'responseCode', denied);
+      await expectLater(
+          live.session.getObjectPropList(_folderHandle, depth: 1),
+          throwsA(accessDenied));
+      await expectLater(live.session.getObjectInfo(_jpgHandle),
+          throwsA(accessDenied));
+      await expectLater(live.session.getPartialObject(_jpgHandle, 0, 65536),
+          throwsA(accessDenied));
+
+      await live.session.changeCameraMode(1);
+      expect(camera.device.cameraMode, 1);
+      expect(await live.session.getObjectHandles(), contains(_jpgHandle));
+      await expectLater(live.session.getObjectInfo(_jpgHandle),
+          throwsA(accessDenied));
     });
 
     test('缩略字节:GetThumb / 0x90C4 与 mock 合成逐字节一致且真可解码',

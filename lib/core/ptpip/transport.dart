@@ -503,7 +503,8 @@ final class PtpIpTransport implements PtpTransport, PtpCancelCapable {
         case EventPacket ev:
           // 个别固件把事件发到 command 通道:转投广播
           AppLog.d(AppLog.protocol,
-              '←事件 ${_hx(ev.eventCode)} tid=${ev.transactionId}');
+              '←事件(command) ${_hx(ev.eventCode)} tid=${ev.transactionId}'
+              ' 参数 ${ev.params}');
           _eventsCtrl.add(PtpEvent(
             code: ev.eventCode,
             transactionId: ev.transactionId,
@@ -537,7 +538,8 @@ final class PtpIpTransport implements PtpTransport, PtpCancelCapable {
       switch (packet) {
         case EventPacket ev:
           AppLog.d(AppLog.protocol,
-              '←事件 ${_hx(ev.eventCode)} tid=${ev.transactionId}');
+              '←事件(event) ${_hx(ev.eventCode)} tid=${ev.transactionId}'
+              ' 参数 ${ev.params}');
           _eventsCtrl.add(PtpEvent(
             code: ev.eventCode,
             transactionId: ev.transactionId,

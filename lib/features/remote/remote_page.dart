@@ -224,7 +224,7 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
     // 引擎 failed 态进页也由此重试。直挂/未连接场景 linkUp 是冷启乐观
     // 门闩(恒真)照样发,失败落占位「重试取景」,与真连接同形。
     // 十二轮:设置里持久关过取景 → 控制器闸门挡住(上面刚同步)。
-    if (widget.active && !controller.liveViewActive) {
+    if (widget.active && !controller.liveViewActive && !controller.galleryFirst) {
       unawaited(controller.autoLiveViewOnConnect());
     }
     // 进页对表:先读拍摄模式再刷参数(2026-10-11 真机反馈:视频档进页
@@ -235,8 +235,11 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
     // 门闩(恒真)不能作凭;直挂/未连接场景引擎 idle,零请求。
     // 张数对表住 refreshParams 链首(2026-10-16):进页第二笔即对上,
     // 不再挂整条链尾等几秒。
-    if (widget.active && controller.liveViewActive) {
+    if (widget.active && (controller.liveViewActive || controller.galleryFirst)) {
       unawaited(() async {
+        if (controller.galleryFirst && !controller.liveViewActive) {
+          await controller.autoLiveViewOnConnect();
+        }
         await controller.refreshCameraMode(triggerRefresh: false);
         // joinInFlight:连接沿刷参全链常还在跑,并入不另起一条(两条
         // 全链在 Wi-Fi 上把取景帧压成幻灯片,2026-10-16 真机反馈)。

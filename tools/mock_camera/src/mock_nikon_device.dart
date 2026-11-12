@@ -54,7 +54,9 @@ final class MockNikonDevice {
     // 定宽左补零,镜像 Zf 序列号方言(客户端 _normalizeSerial 剥前导零)。
     this.serialNumber = '000000000000000000000000MOCK0001',
     this.storageId = 0x00010001,
-  }) : _objects = List.of(objects ?? defaultMockObjects());
+    Set<int> deniedOperations = const {},
+  })  : _objects = List.of(objects ?? defaultMockObjects()),
+        _deniedOperations = Set.unmodifiable(deniedOperations);
 
   final String model;
   final String manufacturer;
@@ -65,6 +67,7 @@ final class MockNikonDevice {
   final int storageId;
 
   final List<MockObject> _objects;
+  final Set<int> _deniedOperations;
 
   // ── 会话状态(客户端可观测,mock 单连接语义) ──
   bool sessionOpen = false;
@@ -121,6 +124,9 @@ final class MockNikonDevice {
         opcode != PtpOperationCode.getDeviceInfo &&
         opcode != PtpOperationCode.openSession) {
       return const MockPtpReply(code: PtpResponseCode.sessionNotOpen);
+    }
+    if (_deniedOperations.contains(opcode)) {
+      return const MockPtpReply(code: PtpResponseCode.accessDenied);
     }
     switch (opcode) {
       case PtpOperationCode.getDeviceInfo:

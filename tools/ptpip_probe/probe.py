@@ -143,6 +143,7 @@ NIKON_GET_LIVEVIEW_IMG = 0x9203
 NIKON_GET_LIVEVIEW_IMG_EX = 0x9428  # OpenZCine 全系取帧码(ZR dump 实证带 display-info 头)
 NIKON_CHANGE_AF_AREA = 0x9205  # p1/p2 = whole-size 坐标(OpenZCine PTPIPClientSession)
 NIKON_AF_DRIVE = 0x90C1
+NIKON_CHANGE_CAMERA_MODE = 0x90C2
 NIKON_CHANGE_APPLICATION_MODE = 0x9435  # Z 系方言:遥控 op 前须切应用模式(app enableAppControl 同款)
 NIKON_DEVICE_READY = 0x90C8
 NIKON_GET_PICTCTRL_DATA = 0x90CC  # 优化校准槽位详情:params[槽位,0],name=数据[2..22) ASCII(官方 §9.9:BasePictureControl 2B + RegistrationName 20B;[3..23) 是 digiCamControl 旧机型口径,会吞首字母)
@@ -267,9 +268,7 @@ def recv_exact(sock: socket.socket, n: int) -> bytes:
     while len(buf) < n:
         chunk = sock.recv(n - len(buf))
         if not chunk:
-            raise ConnectionError(
-                "连接被相机关闭 —— 常见原因是字节序/布局错误被静默丢弃"
-            )
+            raise ConnectionError("相机关闭了 TCP 连接")
         buf += chunk
     return buf
 
@@ -434,6 +433,59 @@ def cmd_xact(cmd: socket.socket, tid: Tid, opcode: int, params=(),
     cmd.sendall(op_request(opcode, params, tid=t, dp=dp))
     payload, stats, resp = read_data_phase(cmd, t, collect=collect)
     return t, payload, stats, resp
+
+def gallery_remote_cycle(cmd: socket.socket, tid: Tid) -> bool:
+    codes = []
+    for mode in (1, 0):
+        try:
+            _, _, _, (code, _, _) = cmd_xact(
+                cmd, tid, NIKON_CHANGE_CAMERA_MODE, [mode], dp=DP_NO_DATA)
+        except (OSError, ProtocolError) as error:
+            raise ConnectionError(f"ChangeCameraMode (0x90C2) {mode} 未收到响应: {error}") from error
+        codes.append(code)
+        print(f"ChangeCameraMode (0x90C2) {mode} <- 0x{code:04X}")
+    return all(code == PTP_OK for code in codes)
+
+
+def probe_gallery_object(cmd: socket.socket, tid: Tid, handle: int) -> int:
+    """Compare read operations on one existing card object in a fresh session."""
+    _, payload, _, (code, _, _) = cmd_xact(
+        cmd, tid, GET_OBJECT_HANDLES, [0xFFFFFFFF, 0, 0])
+    if code != PTP_OK:
+        print(f"GetObjectHandles <- 0x{code:04X}")
+        return 1
+    if len(payload) < 4 or (len(payload) - 4) % 4:
+        raise ProtocolError("GetObjectHandles 数据长度异常")
+    count, *handles = (value for (value,) in struct.iter_unpack("<I", payload))
+    if count != len(handles):
+        raise ProtocolError("GetObjectHandles 对象计数与数据长度不符")
+    print(f"GetObjectHandles <- 0x{code:04X}, {count} 个对象")
+    if handle not in handles:
+        print(f"0x{handle:08X} 不在当前会话的对象列表中。"
+              f"列表末尾: {', '.join(hex(h) for h in handles[-8:])}")
+        return 1
+
+    operations = (
+        (GET_OBJECT_INFO, "GetObjectInfo", [handle]),
+        (0x9805, "GetObjectPropList", [handle, 0, 0xFFFFFFFF, 0, 0]),
+        (GET_THUMB, "GetThumb", [handle]),
+        (0x90C4, "GetLargeThumb", [handle]),
+        (0x101B, "GetPartialObject", [handle, 0, 65536]),
+        (0x9431, "GetPartialObjectEx", [handle, 0, 0, 65536, 0]),
+    )
+    for opcode, name, params in operations:
+        _, data, _, (code, _, _) = cmd_xact(cmd, tid, opcode, params)
+        print(f"{name} (0x{opcode:04X}) 0x{handle:08X} <- 0x{code:04X}, "
+              f"{len(data)}B, 头部={data[:8].hex().upper() or '-'}")
+    return 0
+
+
+def parse_object_handle(value: str) -> int:
+    handle = int(value, 16 if value.lower().startswith("0x") else 10)
+    if not 0 < handle < 0xFFFFFFFF:
+        raise argparse.ArgumentTypeError("对象句柄应为有效的 32 位十进制或 0x 十六进制值")
+    return handle
+
 
 PTP_DTYPES = {
     # typecode -> (struct 格式, 字节宽, 名称);ISO 15740 §9.2
@@ -731,6 +783,13 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="PTP-IP 真机验证(尼康 Z 系列)")
     ap.add_argument("host", nargs="?", default="192.168.1.1", help="相机 IP,默认 192.168.1.1")
     ap.add_argument("--port", type=int, default=PORT)
+    ap.add_argument("--gallery-handle", type=parse_object_handle, metavar="HANDLE",
+                    help="只读图库对照:连接后对指定对象读取元数据、缩略图和 64 KiB 文件头")
+    gallery_modes = ap.add_mutually_exclusive_group()
+    gallery_modes.add_argument("--gallery-compare-remote", action="store_true",
+                               help="先读取，再执行遥控模式 1→0，并重复读取")
+    gallery_modes.add_argument("--gallery-remote-first", action="store_true",
+                               help="刚开会话就执行遥控模式 1→0，再读取图库")
     ap.add_argument("--hostname", default="Android Device",
                     help="InitCommandReq 主机名(尼康方言默认 Android Device,Camera_Bridge 实证值)")
     ap.add_argument("--idle", type=int, default=0, metavar="SECONDS",
@@ -776,12 +835,15 @@ def main() -> int:
                          "的无线对照):FORM 枚举全量 + 每槽位 0x90CC "
                          "GetPictCtrlData 读注册名(自定义/云组真名)")
     args = ap.parse_args()
+    if (args.gallery_compare_remote or args.gallery_remote_first) and args.gallery_handle is None:
+        ap.error("图库遥控模式对照需要同时指定 --gallery-handle")
 
+    print(f"[1] 正在连接相机 {args.host}:{args.port}…", flush=True)
     try:
         cmd = connect_camera(args.host, args.port)
     except OSError as e:
         print(f"[1] 无法连接 {args.host}:{args.port}({e})"
-              f"—— 检查相机 Wi-Fi 是否开着、Mac 是否在热点上")
+              "—— 检查相机 Wi-Fi 是否开启，以及电脑是否与相机处于同一网络")
         return 2
     cmd.settimeout(READ_TIMEOUT)
     print(f"[1] TCP 已连接 {args.host}:{args.port}(command 通道)")
@@ -799,7 +861,14 @@ def main() -> int:
         return 2
     print(f"[2] <- {describe(ptype, body)}")
     if ptype == INIT_FAIL:
-        print("    InitFail:检查主机名编码(UTF-16LE)与长度字段(u32)")
+        cmd.close()
+        reason = struct.unpack_from("<I", body)[0] if len(body) >= 4 else None
+        if reason == 1:
+            print("    相机拒绝新会话。先断开 ZPill、ZRelay 和 SnapBridge，"
+                  "再让相机退出并重新进入 Wi-Fi 连接后重试。")
+            print("    若仍被拒，请核对相机的配对对象。探针使用独立的客户端身份。")
+        else:
+            print("    相机拒绝 PTP/IP 初始化，请核对连接模式和配对状态。")
         return 1
     if ptype != INIT_CMD_RESP:
         print(f"    意外包类型 {ptype},期望 {INIT_CMD_RESP}")
@@ -838,7 +907,7 @@ def main() -> int:
         print(f"    model={info['model']} version={info['version']} "
               f"functionalMode=0x{info['functional_mode']:04X} ops={len(info['operations'])}")
         if GET_OBJECT not in info["operations"]:
-            print("    [发现] op 表缺 GetObject —— 受限画像态(USB 见过 23 op 副面孔)")
+            print("    [发现] op 表未列 GetObject；无线会话的实际可用性以读取结果为准")
         if len(info["operations"]) < 30:
             print(f"    op 表({len(info['operations'])}): "
                   f"{' '.join(f'0x{o:04X}' for o in info['operations'])}")
@@ -850,6 +919,33 @@ def main() -> int:
     if code != PTP_OK:
         print(f"[5] OpenSession 失败:0x{code:04X}")
         return 1
+
+    if args.gallery_handle is not None:
+        with cmd, evt:
+            try:
+                mode_ready = True
+                if args.gallery_remote_first:
+                    print("=== 新会话：先切换遥控模式，再读取图库 ===")
+                    mode_ready = gallery_remote_cycle(cmd, tid)
+                    if not mode_ready:
+                        print("遥控模式切换未完整成功，跳过切换后的读取")
+                if args.gallery_compare_remote:
+                    print("=== 新会话：遥控模式切换前 ===")
+                result = probe_gallery_object(cmd, tid, args.gallery_handle) if mode_ready else 1
+                if args.gallery_compare_remote and result == 0:
+                    if gallery_remote_cycle(cmd, tid):
+                        print("=== 同一会话：遥控模式切换后 ===")
+                        result = probe_gallery_object(cmd, tid, args.gallery_handle)
+                    else:
+                        print("遥控模式切换未完整成功，无法比较切换前后")
+                        result = 1
+                _, _, _, (code, _, _) = cmd_xact(
+                    cmd, tid, CLOSE_SESSION, dp=DP_NO_DATA)
+                print(f"CloseSession <- 0x{code:04X}")
+                return result if code == PTP_OK else 1
+            except (OSError, ProtocolError) as error:
+                print(f"图库对照中止: {error}")
+                return 1
 
     # 步骤 6:GetObjectHandles —— parent=0 与 0xFFFFFFFF 对比(Zf USB 上语义反转)。
     # 尼康方言注意:SnapBridge 会话下 GetStorageIDs 被拒(Camera_Bridge 实证),

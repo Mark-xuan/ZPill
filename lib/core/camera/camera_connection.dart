@@ -230,7 +230,7 @@ final class CameraConnectionImpl implements CameraConnection {
 
   /// 最近一次成功连接的档案(无线 = IP/实例名;USB = ip:null)。
   /// connected 断链后据此选路自动重连;手动 disconnect 清空。
-  ({String? ip, String? instanceName})? _lastGood;
+  ({String? ip, String? instanceName, bool rememberIp})? _lastGood;
 
   /// 当前连接是否由恢复循环建立:DROP 记账口径 =「恢复建立的连接再次
   /// 断链」,首断与尝试失败都不计(防秒连秒断风暴把机身 PTP 栈打进
@@ -283,6 +283,14 @@ final class CameraConnectionImpl implements CameraConnection {
 
   @override
   String? get deviceModel => _deviceModel;
+
+  /// Z 30 的 STA 会话先保留读卡能力，进入拍摄时再开启取景。
+  bool get galleryFirst => _lastGood?.rememberIp == true && _isZ30(_deviceModel);
+
+  static bool _isZ30(String? model) {
+    final normalized = model?.toUpperCase().replaceAll(RegExp(r'\s+'), '');
+    return normalized == 'Z30' || normalized == 'NIKONZ30';
+  }
 
   @override
   bool get isWireless => _wireless;
@@ -473,8 +481,14 @@ final class CameraConnectionImpl implements CameraConnection {
       // 对 op 死寂的半哑态,旧路径 0x9435 挂满 15s 看门狗后还会带毒转
       // connected(链路已毒、状态机报连上,真机 2026-10-08「上次」连接
       // 很久的场景之一)—— 预算内收不掉就按「连接超时」failed 收口。
-      await _session.enableAppControl(remoteLatch: true)
-          .timeout(_wirelessConnectBudget);
+      // STA 的 Z 30 已在真机复现：直接读卡正常，0x90C2(1) 后相机断开。
+      // STA 保存可复用地址，AP 调用以 rememberIp: false 保留原有遥控路径。
+      if (rememberIp && _isZ30(info.model)) {
+        AppLog.i(AppLog.connection, 'Z 30 STA: 保留读卡会话，跳过连接时的遥控切换');
+      } else {
+        await _session.enableAppControl(remoteLatch: true)
+            .timeout(_wirelessConnectBudget);
+      }
       // 连接档案落账(不管相机侧配对是否完成):扫描出的 IP/展示名进
       // 快速重连列表 —— STA「连接至计算机」模式相机不答 0x952B,旧
       // 逻辑只配对成功才落账 → 该模式永远存不下来(2026-10-06 真机
@@ -491,7 +505,7 @@ final class CameraConnectionImpl implements CameraConnection {
           _state == CameraLinkState.failed) {
         return;
       }
-      _lastGood = (ip: ip, instanceName: instanceName);
+      _lastGood = (ip: ip, instanceName: instanceName, rememberIp: rememberIp);
       _setError(null);
       _transition(CameraLinkState.connected);
     } on Exception catch (e) {
@@ -705,7 +719,7 @@ final class CameraConnectionImpl implements CameraConnection {
         _state == CameraLinkState.failed) {
       return;
     }
-    _lastGood = (ip: null, instanceName: null);
+    _lastGood = (ip: null, instanceName: null, rememberIp: false);
     _deviceName = _deviceLabel(info, null);
     _deviceModel = info.model;
     _setError(null);
@@ -987,7 +1001,9 @@ final class CameraConnectionImpl implements CameraConnection {
           await _connectUsb(silent: true);
         } else {
           await _connectWireless(profile.ip!,
-              instanceName: profile.instanceName, silent: true);
+              instanceName: profile.instanceName,
+              silent: true,
+              rememberIp: profile.rememberIp);
         }
         // 转正由拨号路径完成(含配对后 60s 窗嵌套全程);aborted(等待
         // 期被外部收口)时状态已处理,不置恢复标记。

@@ -63,6 +63,11 @@ final class NikonEventPoller {
       final events = await session.getEventEx();
       _failures = 0;
       if (events.isNotEmpty) {
+        for (final event in events) {
+          final code = event.code.toRadixString(16).toUpperCase();
+          AppLog.d(AppLog.protocol,
+              'GetEventEx ←事件 0x$code 参数 ${event.params}');
+        }
         _noteUncatalogued(events);
         session.emitPolledEvents(events);
       }

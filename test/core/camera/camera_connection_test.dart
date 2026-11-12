@@ -158,6 +158,7 @@ Future<void> scriptHandshakeAndOpen(
   FakePtpIpChannel command,
   FakePtpIpChannel event, {
   List<int>? deviceInfoOperations,
+  String deviceModel = 'TestModel',
 }) async {
   await pumpEventQueue();
   command.emit(_frameOf(InitCommandResponsePacket(
@@ -171,8 +172,8 @@ Future<void> scriptHandshakeAndOpen(
   await pumpEventQueue();
 
   final dataset = deviceInfoOperations == null
-      ? buildDeviceInfoDataset()
-      : buildDeviceInfoDataset(operations: deviceInfoOperations);
+      ? buildDeviceInfoDataset(model: deviceModel)
+      : buildDeviceInfoDataset(model: deviceModel, operations: deviceInfoOperations);
   final gid = _codec.decode(command.sent.last) as OperationRequestPacket;
   expect(gid.opcode, PtpOperationCode.getDeviceInfo);
   command.emit(_frameOf(StartDataPacket(
@@ -661,6 +662,25 @@ void main() {
       expect(conn.deviceName, 'TestModel_12345678901',
           reason: '手动 IP 无实例名:型号_序列号拼装(非纯型号)');
       expect(session.isSessionOpen, isTrue);
+    });
+
+    test('Z 30 STA 保留读卡会话，AP 仍执行遥控模式切换', () async {
+      for (final sta in [true, false]) {
+        final usb = FakeUsbHostChannel(const []);
+        final (conn, _, session, command, event, _) = wireWireless(usb);
+        final connecting = conn.connect(ip: '192.168.1.241', rememberIp: sta);
+        await scriptHandshakeAndOpen(command, event, deviceModel: 'Z 30');
+        if (!sta) await scriptAppMode(command);
+        await connecting;
+
+        final lastRequest = _codec.decode(command.sent.last) as OperationRequestPacket;
+        expect(lastRequest.opcode, sta
+            ? PtpOperationCode.openSession
+            : NikonOperationCode.changeCameraMode);
+        expect(conn.state, CameraLinkState.connected);
+        expect(conn.galleryFirst, sta);
+        expect(session.isSessionOpen, isTrue);
+      }
     });
 
     test('断链(command 通道被关):connected → reconnecting(自动恢复),'

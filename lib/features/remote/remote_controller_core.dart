@@ -13,6 +13,10 @@ mixin _RemoteCore on ChangeNotifier {
   bool Function() get _setPropEnabled;
 
   bool get apMode => isApMode?.call() ?? false;
+  bool get galleryFirst => switch (connection) {
+        CameraConnectionImpl(:final galleryFirst) => galleryFirst,
+        _ => false,
+      };
   bool get takeoverActive => _takeoverActive;
 
   // ---- 跨域钩子(域内实现,linearization 解析)----
@@ -504,6 +508,11 @@ mixin _RemoteCore on ChangeNotifier {
   /// 录像被 liveViewActive 门拦住,唯退出拍摄页重进才恢复。由持有
   /// _linkUp 的本控制器自驱,顺序不再寄望装配序。
   Future<void> _onConnectedChain() async {
+    if (galleryFirst) {
+      _startSettledGate.complete();
+      _startSettledGate = Completer<void>();
+      return;
+    }
     // AP 直连主动接管(2026-10-15 用户定案,取代「失败后引导」两步流):
     // 点连接 = 接管同意 —— 连上先持 remote 模式(机身停「已连接到计算
     // 机」屏 + 拨盘锁定,连接页 AP 卡有提示),0x9201 取景门随之开,

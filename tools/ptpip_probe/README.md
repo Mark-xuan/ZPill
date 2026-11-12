@@ -13,6 +13,20 @@ python3 tools/ptpip_probe/probe.py --hostname MacBook 192.168.1.1
 
 零依赖,仅标准库(Python 3.10+)。
 
+### 单张照片的图库对照
+
+让电脑与相机处在同一网络，断开占用相机会话的 App，再传入本次连接中要验证的照片句柄。用同一张未标记上传的照片分别测试 AP 和 STA。
+
+```powershell
+python tools/ptpip_probe/probe.py <相机IP> --gallery-handle 689504361
+```
+
+此模式记录单个对象的元数据、缩略图和两种分块读取的响应码与长度。两种分块读取各请求 64 KiB，不保存照片。若句柄已变化，输出会列出当前会话最后几个句柄供核对。
+
+加上 `--gallery-compare-remote` 可在同一个会话里执行一次 `ChangeCameraMode(1)` 再执行 `ChangeCameraMode(0)`，并比较切换前后的读取结果。该对照不会开启实时取景。
+
+用 `--gallery-remote-first` 可在 `OpenSession` 成功后立即切换遥控模式，再读取同一个对象，核对 ZPill 的连接顺序。两个对照选项互斥。
+
 ## 当前覆盖
 
 - [x] command 通道 TCP 连接 + InitCommandRequest/Response

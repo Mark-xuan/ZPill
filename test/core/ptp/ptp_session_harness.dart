@@ -206,6 +206,7 @@ Uint8List minimalObjectInfoDataset(String filename) {
 /// 2026-10-01 真机受限态就是缺它)。
 Uint8List buildDeviceInfoDataset(
     {List<int> operations = const [0x1001, 0x1007, 0x1009, 0x9431],
+    String model = 'TestModel',
     String serial = '012345678901'}) {
   final w = ByteWriter()
     ..u16(0x0100) // StandardVersion = 100(PTP/1.0)
@@ -229,7 +230,7 @@ Uint8List buildDeviceInfoDataset(
     ..u16(0x3000)
     ..u16(0x3801); // imageFormats
   putPtpString(w, 'Nikon Corp'); // manufacturer
-  putPtpString(w, 'TestModel'); // model
+  putPtpString(w, model);
   putPtpString(w, 'V1.00'); // deviceVersion
   putPtpString(w, serial); // serialNumber
   return w.takeBytes();
