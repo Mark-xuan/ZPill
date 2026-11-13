@@ -398,11 +398,31 @@ class _PhotoGridPageState extends State<PhotoGridPage>
   /// 并解码会与可视格抢通道/CPU,Android/ohos 真机表现为猛滑掉帧
   /// (2026-11-05 复报);滚停后 [_prefetchWindowNow] 一次补当前窗口。
   bool _scrolling = false;
+  static const _pageSize = 24;
+  int _visibleLimit = _pageSize;
+  int _pageViewRev = -1;
+  bool _hasMore = false;
+  double _loadMoreDrag = 0;
+
+  void _loadMore() {
+    if (!_hasMore || !mounted) return;
+    if (widget.controller.syncing) return;
+    setState(() => _visibleLimit += _pageSize);
+    if (widget.controller.hasMoreMetadata) unawaited(widget.controller.loadMore());
+  }
+
 
   bool _onScrollNotification(ScrollNotification n) {
+    if (n.depth != 0) return false;
     if (n is ScrollStartNotification) {
+      _loadMoreDrag = 0;
       _scrolling = true;
+    } else if (n is OverscrollNotification &&
+        n.dragDetails != null && n.overscroll > 0 && _hasMore) {
+      _loadMoreDrag += n.overscroll;
     } else if (n is ScrollEndNotification) {
+      if (_loadMoreDrag >= 64) _loadMore();
+      _loadMoreDrag = 0;
       _scrolling = false;
       _prefetchWindowNow();
     }
@@ -946,7 +966,17 @@ class _PhotoGridPageState extends State<PhotoGridPage>
   /// 主体四态:无内容硬错误屏 / 首块前骨架 / 空相册提示 / 内容网格
   /// (同步中断仅软横幅,已显示内容可继续浏览,下拉刷新重枚举)。
   Widget _body(BrowserController controller, List<_GridItem> cells) {
+    if (_pageViewRev != _viewRev) {
+      _pageViewRev = _viewRev;
+      _visibleLimit = _pageSize;
+    }
+    _hasMore = cells.length > _visibleLimit || controller.hasMoreMetadata;
+    cells = cells.take(_visibleLimit).toList(growable: false);
     _resetPrefetchAnchors(cells); // items 换实例(刷新/切换):预取锚点重置
+    if (cells.isEmpty && controller.hasMoreMetadata) {
+      return Center(child: TextButton(onPressed: controller.syncing ? null : _loadMore,
+          child: Text(context.t('grid.loadMoreMetadata'))));
+    }
     if (cells.isEmpty) {
       if (controller.error != null) {
         return ErrorRetryPanel(
@@ -993,7 +1023,7 @@ class _PhotoGridPageState extends State<PhotoGridPage>
               onNotification: _onScrollNotification,
               child: CustomScrollView(
                 // 常可滚动:内容不足一屏时下拉刷新仍可用。
-                physics: const AlwaysScrollableScrollPhysics(),
+                physics: const AlwaysScrollableScrollPhysics(parent: ClampingScrollPhysics()),
                 slivers: [
                   // 时间排序才按拍摄日分段;文件名/文件大小排序列平铺。
                   if (_sort.key == MediaSortKey.time)
@@ -1053,6 +1083,17 @@ class _PhotoGridPageState extends State<PhotoGridPage>
                     ),
                   // 尾部留白:滚到底最后一行不贴死底缘(ohos 真机底部安全
                   // 区常报 0,手势条会压住最后一行;iOS 自动安全区外再垫一档)。
+                  if (_hasMore)
+                    SliverToBoxAdapter(
+                      child: Padding(
+                        padding: const EdgeInsets.all(16),
+                        child: TextButton(
+                          key: const ValueKey('cameraLoadMore'),
+                          onPressed: _loadMore,
+                          child: Text(context.t(controller.syncing ? 'grid.loadingMore' : controller.hasMoreMetadata ? 'grid.loadMoreMetadata' : 'grid.loadMore')),
+                        ),
+                      ),
+                    ),
                   const SliverPadding(
                     padding: EdgeInsets.only(bottom: 48),
                   ),

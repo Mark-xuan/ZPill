@@ -187,7 +187,7 @@ def packet(ptype: int, body: bytes = b"") -> bytes:
 NIKON_ANDROID_GUID = bytes.fromhex("00112233445566778899AABBCCDDEEFF")
 PTPIP_VERSION = 0x00010000  # 协议版本 1.0,小端 u32,附在 Init 末尾
 
-def init_command_request(hostname: str) -> bytes:
+def init_command_request(hostname: str, client_guid: bytes = NIKON_ANDROID_GUID) -> bytes:
     """尼康 Wi-Fi 方言(MTP/IP 布局):GUID(16B 固定值)+ UTF-16LE
     主机名(NUL 结尾,**无长度前缀**)+ u32 协议版本。
 
@@ -195,7 +195,7 @@ def init_command_request(hostname: str) -> bytes:
     设备」模式下被相机当乱码丢弃(读完即 FIN)—— 见模块 docstring。
     """
     name = (hostname + "\x00").encode("utf-16-le")
-    return packet(INIT_CMD_REQ, NIKON_ANDROID_GUID + name + u32(PTPIP_VERSION))
+    return packet(INIT_CMD_REQ, client_guid + name + u32(PTPIP_VERSION))
 
 def init_event_request(connection_number: int) -> bytes:
     return packet(INIT_EVENT_REQ, u32(connection_number))

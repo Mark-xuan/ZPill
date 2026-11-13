@@ -536,6 +536,7 @@ final class TransferEngineImpl
           bytes: dl.bytes,
           elapsed: dl.elapsed,
           averageBytesPerSecond: dl.averageBytesPerSecond,
+          fromCache: dl.fromCache,
         );
       }
       job.batch.downloads[job.task.id] = dl;
@@ -544,7 +545,7 @@ final class TransferEngineImpl
       job.task = job.task.copyWith(
           state: TransferState.processing,
           receivedBytes: dl.bytes,
-          downloadMs: _attemptMs(job));
+          downloadMs: dl.fromCache ? 0 : _attemptMs(job));
       _notify();
       _enqueuePostproc(job, dl);
     } on DownloadPausedException catch (e) {

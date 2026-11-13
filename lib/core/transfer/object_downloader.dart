@@ -49,6 +49,8 @@ import '../ptp/operation_codes.dart';
 import '../ptp/ptp_session.dart';
 import '../ptp/ptp_transport.dart';
 import 'aimd_chunk.dart';
+import 'z30_transfer_profile.dart';
+import '../utils/priority_work_queue.dart';
 
 /// 逐块记账门槛(真机标定数据源,2026-10-25):实收大档(≥4MB)才
 /// 逐块记 AppLog —— 缩略图/头读走同一下载器,不吵日志环。
@@ -95,12 +97,14 @@ final class ObjectDownload {
     required this.bytes,
     required this.elapsed,
     required this.averageBytesPerSecond,
+    this.fromCache = false,
   });
 
   final String path;
   final int bytes;
   final Duration elapsed;
   final double averageBytesPerSecond;
+  final bool fromCache;
 
   double get megabytesPerSecond => averageBytesPerSecond / 1024 / 1024;
 }
@@ -116,6 +120,10 @@ class ObjectDownloader {
     AimdChunkPolicy? exChunkPolicy,
     int? Function()? chunkCap,
     this.chunkedCancelAboveBytes,
+    Future<Z30TransferProfile>? z30StartupProfile,
+    Future<String> Function()? originalCacheDir,
+    Object Function()? originalCacheEpoch,
+    int originalCacheLimitBytes = 256 * 1024 * 1024,
   })  : // 每下载器(= 传输会话)一个策略实例:跨 download 调用延续学习,
         // 不跨下载器/会话共享。注入是测试口径(小数值 + 判快阈值可控);
         // 缺省自建,上限随 [partialChunkBytes](生产 iOS = 1MB)。
@@ -138,9 +146,14 @@ class ObjectDownloader {
             ),
         _enablePartialObjectEx = enablePartialObjectEx,
         _chunkCap = chunkCap,
-        _session = session;
+        _session = session,
+        _z30StartupProfile = z30StartupProfile,
+        _originalCacheDir = originalCacheDir,
+        _originalCacheEpoch = originalCacheEpoch,
+        _originalCacheLimitBytes = originalCacheLimitBytes;
 
   final PtpSession _session;
+  final Future<Z30TransferProfile>? _z30StartupProfile;
 
   /// 分块路线开关 + 单块上限([AimdChunkPolicy] 缺省自建时的封顶;
   /// 注入策略时本值只当路线开关,大小演化全归策略)。null = 整档
@@ -181,6 +194,109 @@ class ObjectDownloader {
   /// 节奏互不拖拽;降级回 0x101B 时旧账原样续用)。
   final AimdChunkPolicy _exPolicy;
 
+  final Future<String> Function()? _originalCacheDir;
+  final Object Function()? _originalCacheEpoch;
+  final int _originalCacheLimitBytes;
+  final PriorityWorkQueue _cacheQueue = PriorityWorkQueue();
+  Object? _cachedEpoch;
+  Directory? _cacheDirectory;
+  final Map<String, File> _originals = {};
+
+  /// Only completed Z30 JPEG originals are cached. Consumers always own a copy,
+  /// so preview cleanup and transfer post-processing cannot mutate the cache.
+  Future<ObjectDownload> download(
+    ObjectEntry entry, {
+    required String targetDir,
+    void Function(int receivedBytes)? onProgress,
+    bool Function()? isCancelled,
+    bool Function()? isPaused,
+    String? resumePath,
+    int resumeOffset = 0,
+  }) async {
+    final epoch = _originalCacheEpoch?.call();
+    final profile = entry.requiresExtendedRead
+        ? await _z30StartupProfile ?? Z30TransferProfile.normal
+        : Z30TransferProfile.normal;
+    Future<ObjectDownload> read() => _downloadUncached(entry,
+        targetDir: targetDir, profile: profile, onProgress: onProgress,
+        isCancelled: () => isCancelled?.call() == true ||
+            (_originalCacheEpoch != null && _originalCacheEpoch() != epoch),
+        isPaused: isPaused, resumePath: resumePath, resumeOffset: resumeOffset);
+    if (_originalCacheDir == null || !entry.requiresExtendedRead ||
+        entry.sizeInBytes > _originalCacheLimitBytes || resumePath != null ||
+        profile.bypassOriginalCache) {
+      return read();
+    }
+    // Serialize cache consumers: a second request waits for the first complete
+    // file instead of starting an interleaved duplicate camera transfer.
+    final queueWatch = Stopwatch()..start();
+    final priority = PriorityWorkQueue.currentPriority;
+    final result = _cacheQueue.run(() async {
+      AppLog.i(AppLog.transfer, 'download scheduled h=${entry.handle} priority=$priority wait_ms=${queueWatch.elapsedMilliseconds}');
+      if (isCancelled?.call() == true ||
+          (_originalCacheEpoch != null && _originalCacheEpoch() != epoch)) {
+        throw const DownloadCancelledException();
+      }
+      if (isPaused?.call() == true) return read();
+      final Directory root;
+      try {
+        root = _cacheDirectory ??= Directory(await _originalCacheDir());
+        if (!await root.exists()) await root.create(recursive: true);
+      } on FileSystemException {
+        return read();
+      }
+      if (_cachedEpoch != epoch || _originals.isEmpty) {
+        // Dedicated cache directory only; leftovers from a previous app launch
+        // are never reused because camera handles are session-scoped.
+        await for (final entity in root.list()) {
+          if (entity is File) await _deleteQuietly(entity);
+        }
+        _originals.clear();
+        _cachedEpoch = epoch;
+      }
+      final key = '${entry.handle}_${entry.sizeInBytes}';
+      final cached = _originals.remove(key);
+      if (cached != null && await cached.exists() &&
+          await cached.length() == entry.sizeInBytes) {
+        _originals[key] = cached;
+        final dir = await Directory(targetDir).create(recursive: true);
+        final path = await uniquePath(dir, _safeBasename(entry.name));
+        await cached.copy(path);
+        if (isCancelled?.call() == true ||
+            (_originalCacheEpoch != null && _originalCacheEpoch() != epoch)) {
+          await _deleteQuietly(File(path));
+          throw const DownloadCancelledException();
+        }
+        onProgress?.call(entry.sizeInBytes);
+        AppLog.i(AppLog.transfer, '原图缓存命中 ${entry.name}，本次未读取相机');
+        return ObjectDownload(path: path, bytes: entry.sizeInBytes,
+            elapsed: Duration.zero, averageBytesPerSecond: 0, fromCache: true);
+      }
+      final downloaded = await read();
+      if (_originalCacheEpoch == null || _originalCacheEpoch() == epoch) {
+        try {
+          final file = await File(downloaded.path).copy('${root.path}/$key.jpg');
+          _originals[key] = file;
+          var total = 0;
+          for (final f in _originals.values) {
+            if (await f.exists()) total += await f.length();
+          }
+          while (total > _originalCacheLimitBytes && _originals.length > 1) {
+            final oldest = _originals.remove(_originals.keys.first)!;
+            if (await oldest.exists()) total -= await oldest.length();
+            await _deleteQuietly(oldest);
+          }
+        } on FileSystemException {
+          // Cache storage failure must not invalidate a successful download.
+          await _deleteQuietly(File('${root.path}/$key.jpg'));
+          _originals.remove(key);
+        }
+      }
+      return downloaded;
+    });
+    return result;
+  }
+
   /// 流式下载 [entry] 到 [targetDir](不存在则创建),文件名冲突自动
   /// 加 ` (n)` 序号。[onProgress] 回调累计字节数(整档路线块大小对齐
   /// kUsbStreamChunkBytes,64KB 级;分块路线 = AIMD 策略当前块,见
@@ -191,15 +307,19 @@ class ObjectDownloader {
   /// 从该偏移起;整档路线无法中途续传,丢弃半成品从头下)。
   /// [isPaused] = 队列暂停旗标:分块路线在块界检查,命中即停并保留半
   /// 成品;整档路线不中断(小档跑完,泵随后停在队列界)。
-  Future<ObjectDownload> download(
+  Future<ObjectDownload> _downloadUncached(
     ObjectEntry entry, {
     required String targetDir,
+    required Z30TransferProfile profile,
     void Function(int receivedBytes)? onProgress,
     bool Function()? isCancelled,
     bool Function()? isPaused,
     String? resumePath,
     int resumeOffset = 0,
   }) async {
+    if (entry.requiresExtendedRead) {
+      AppLog.i(AppLog.transfer, 'download profile mode=${profile.name} h=${entry.handle} chunk_kib=${profile.chunkKiB} hs=${profile.highSpeed} resume=$resumeOffset size=${entry.sizeInBytes}');
+    }
     final dir = Directory(targetDir);
     if (!dir.existsSync()) {
       dir.createSync(recursive: true);
@@ -240,7 +360,8 @@ class ObjectDownloader {
     var paused = false;
     var chunked = false;
     try {
-      chunked = partialChunkBytes != null && await _partialReadable();
+      chunked = entry.requiresExtendedRead ||
+          (partialChunkBytes != null && await _partialReadable());
       // 大档 + 可取消:整档排空不可接受,改走分块(见字段注)。相机
       // 不支持 0x101B 时回落整档,行为与旧版一致。
       if (!chunked &&
@@ -264,13 +385,47 @@ class ObjectDownloader {
       // 逐块记账只在实收大档(见 _kLoudChunkLogBytes):同一下载器
       // 还服务缩略图/头读,小档不吵日志环。
       final loud = entry.sizeInBytes >= _kLoudChunkLogBytes;
-      if (chunked) {
+      var highSpeedDone = false;
+      if (entry.requiresExtendedRead && profile.highSpeed && !resumed &&
+          PriorityWorkQueue.currentPriority == 0) {
+        try {
+          await _session.getObjectHighSpeed(entry.handle, entry.sizeInBytes,
+              (profile.chunkKiB == 0 ? 1024 : profile.chunkKiB) * 1024,
+              shouldStop: () {
+                cancelled = isCancelled?.call() == true;
+                paused = isPaused?.call() == true;
+                return cancelled || paused;
+              }, onData: (bytes) {
+                sink.add(bytes); received += bytes.length;
+                onProgress?.call(received);
+              });
+          highSpeedDone = true;
+        } on Exception catch (error) {
+          if (error is! PtpResponseException && error is! FormatException) rethrow;
+          AppLog.w(AppLog.transfer, 'hs fallback h=${entry.handle} received=$received cause=$error; restart via 0x9431');
+          await closeSink();
+          sink = file.openWrite(); sinkClosed = false; received = 0;
+        }
+      }
+      if (highSpeedDone) {
+        // Finish through the same cancellation/pause/size checks below.
+      } else if (chunked) {
         // 分块路线:每块是完整事务,取消/失败即停,不再发新命令。取消 =
         // 旗标等**在途块跑完**(≤AIMD 封顶,亚秒级)再停 —— **不对在途
         // 块发 PTP-IP Cancel 包**:2026-10-16 真机 2.2 定案,Zf 收 Cancel
         // 直接掐链(取消即断链);软取消的即时性代价(一块)远小于断链
         // 代价。Cancel-Drain 机制留传输层留档,生产已无调用方。
         var offset = received;
+        // Z30 STA 使用已验证的 256–512 KiB 块减少往返；不代表相机吞吐上限。
+        final extendedReadPolicy = entry.requiresExtendedRead
+            ? AimdChunkPolicy(
+                initialBytes: (profile.chunkKiB == 0 ? 256 : profile.chunkKiB) * 1024,
+                maxBytes: (profile.chunkKiB == 0 ? 512 : profile.chunkKiB) * 1024,
+                hardCapBytes: 2 * 1024 * 1024,
+                stepBytes: 256 * 1024,
+              )
+            : null;
+        var rejectedLargerBlock = false;
         while (offset < entry.sizeInBytes) {
           if (isCancelled != null && isCancelled()) {
             cancelled = true;
@@ -280,9 +435,12 @@ class ObjectDownloader {
             paused = true; // 块界暂停:半成品保留,resume 从 offset 续
             break;
           }
-          final useEx = _enablePartialObjectEx && (_exUsable ?? true);
-          final policy = useEx ? _exPolicy : _chunkPolicy;
-          var want = math.min(policy.currentBytes, entry.sizeInBytes - offset);
+          final useEx = entry.requiresExtendedRead ||
+              (_enablePartialObjectEx && (_exUsable ?? true));
+          final policy = extendedReadPolicy ?? (useEx ? _exPolicy : _chunkPolicy);
+          final chunkBytes =
+              rejectedLargerBlock ? policy.minBytes : policy.currentBytes;
+          var want = math.min(chunkBytes, entry.sizeInBytes - offset);
           // 外部块闸(取景在场保帧,见 [_chunkCap]):只钳本块请求,
           // 不喂策略 —— AIMD 演化照常,闸撤即回策略块。
           final cap = _chunkCap?.call();
@@ -295,7 +453,16 @@ class ObjectDownloader {
                     .getPartialObjectEx(entry.handle, offset, want)
                 : await _session.getPartialObject(entry.handle, offset, want);
           } on PtpResponseException catch (e) {
-            if (useEx && _isExUnsupported(e)) {
+            if (extendedReadPolicy != null &&
+                want > policy.minBytes &&
+                (e.responseCode == PtpResponseCode.invalidParameter ||
+                    e.responseCode == PtpResponseCode.parameterNotSupported)) {
+              rejectedLargerBlock = true;
+              AppLog.w(AppLog.transfer,
+                  '0x9431 拒绝块大小 $want B,从偏移 $offset 用 ${policy.minBytes} B 重试');
+              continue;
+            }
+            if (useEx && !entry.requiresExtendedRead && _isExUnsupported(e)) {
               // 能力拒绝(0x2005/0x2006):≠ 链路信号,不喂策略;本会话
               // 降级 0x101B,本块原样重发(continue 不推进 offset,
               // 降级后 useEx 恒假,无循环风险)。
@@ -305,23 +472,23 @@ class ObjectDownloader {
               _exUsable = false;
               continue;
             }
-            (useEx ? _exPolicy : _chunkPolicy).reportError();
+            policy.reportError();
             rethrow;
           } on TimeoutException {
             // 超时(USB 单事务读超时):链路撑不起这个块大小 —— 喂降。
-            (useEx ? _exPolicy : _chunkPolicy).reportTimeout();
+            policy.reportTimeout();
             rethrow;
           } on PtpCancelledException {
             rethrow; // 取消收口(若上层有取消通道):不惩罚(用户行为 ≠ 链路质量)
           } on Exception {
             // 传输错误(相机拒绝应答 / PTP-IP 看门狗断链 / …):喂降。
-            (useEx ? _exPolicy : _chunkPolicy).reportError();
+            policy.reportError();
             rethrow;
           }
           if (useEx && _exUsable != true) {
             _exUsable = true; // 真发成功:能力坐实
             AppLog.i(AppLog.transfer,
-                '0x9431 接受,Ex 账块 ${_exPolicy.currentBytes ~/ 1024}KB 起爬');
+                '0x9431 接受,Ex 账块 ${policy.currentBytes ~/ 1024}KB 起爬');
           }
           if (chunk.length > want) {
             throw FormatException(
@@ -410,6 +577,7 @@ class ObjectDownloader {
           '实收 ${received}B');
     }
     final attemptBytes = received - attemptBase;
+    AppLog.i(AppLog.transfer, 'download complete h=${entry.handle} bytes=$received network_bytes=$attemptBytes elapsed_ms=${watch.elapsedMilliseconds} chunk_kib=${profile.chunkKiB} hs=${profile.highSpeed}');
     return ObjectDownload(
       path: file.path,
       bytes: received,

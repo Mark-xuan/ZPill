@@ -38,6 +38,7 @@ import 'core/transfer/auto_transfer.dart';
 import 'core/transfer/aimd_chunk.dart';
 import 'core/transfer/object_downloader.dart';
 import 'core/transfer/transfer_engine.dart';
+import 'core/transfer/z30_transfer_profile.dart';
 import 'data/ble_identity_store.dart';
 import 'data/client_identity_store.dart';
 import 'data/config_snapshot_store.dart';
@@ -151,8 +152,22 @@ final class AppServices {
 
   /// 浏览/传输装配:仓库 → 文件操作 → 评分 → 下载器 → 缩略缓存 →
   /// 传输引擎(水印/XMP 注入闭包)→ 速传 → 设置与快照。
+  Future<Z30TransferProfile> _loadZ30StartupProfile() async {
+    try {
+      final profile = (await settingsStore.current()).z30TransferProfile;
+      AppLog.i(AppLog.transfer, 'Z30 startup profile mode=${profile.name}');
+      return profile;
+    } on Exception catch (error) {
+      AppLog.w(AppLog.transfer, 'Z30 profile load failed: $error');
+      return Z30TransferProfile.normal;
+    }
+  }
+
   void _wireBrowseAndTransfer() {
-    repository = ObjectRepositoryImpl(session: session);
+    repository = ObjectRepositoryImpl(
+      session: session,
+      allowJpegReadFallback: () => connection.isZ30Sta,
+    );
     fileOps = CameraFileOps(session: session, repository: repository);
     ratingsStore = FileRatingsStore(dataDir: PlatformServices.gallery.dataDir);
     // 弹层选项持久化(排序/筛选/显示/视图;文件夹不入账,句柄随相机漂移)。
@@ -172,8 +187,14 @@ final class AppServices {
     // 块首选取 Nikon GetPartialObjectEx(0x9431,u64 扩展,规格未记单
     // 块上限,AIMD 可升到 8MB):大档每 MB 事务数直减;相机不认时首块
     // 即本会话降级 0x101B( downloader 内真发试探,不查无线假门表)。
+    Object originalCacheEpoch = Object();
+    connection.states.listen((_) => originalCacheEpoch = Object());
     downloader = ObjectDownloader(
       session: session,
+      z30StartupProfile: _loadZ30StartupProfile(),
+      originalCacheDir: () async =>
+          '${await PlatformServices.gallery.tempDir()}/z30-originals',
+      originalCacheEpoch: () => originalCacheEpoch,
       partialChunkBytes: Platform.isIOS ? 1024 * 1024 : null,
       enablePartialObjectEx: Platform.isIOS,
       // 大档可取消(2026-11-05 传输页复报「取消卡死」):整档 GetObject

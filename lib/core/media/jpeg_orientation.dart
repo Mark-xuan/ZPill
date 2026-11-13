@@ -16,6 +16,103 @@ library;
 
 import 'dart:typed_data';
 
+import 'package:image/image.dart' as img;
+
+/// Extract an embedded EXIF thumbnail from the available JPEG header bytes.
+Uint8List? jpegEmbeddedThumbnail(Uint8List head) {
+  final span = _findExifApp1(head);
+  if (span == null) return null;
+  try {
+    final tiff = Uint8List.sublistView(head, span.$1, span.$2);
+    final exif = img.ExifData.fromInputBuffer(img.InputBuffer(tiff));
+    final thumbnail = exif.thumbnailData;
+    if (thumbnail == null || thumbnail.length < 4 ||
+        thumbnail[0] != 0xFF || thumbnail[1] != 0xD8 ||
+        thumbnail[thumbnail.length - 2] != 0xFF ||
+        thumbnail.last != 0xD9) {
+      return null;
+    }
+    return injectJpegOrientation(thumbnail, jpegExifOrientation(head));
+  } on Exception {
+    return null;
+  } on RangeError {
+    return null;
+  }
+}
+
+/// Follow JPEG APP1/TIFF IFD1 offsets instead of downloading the full image.
+/// Every offset is checked against both the APP1 segment and the object size.
+Future<Uint8List?> readEmbeddedJpegThumbnail(Uint8List head, int fileSize,
+    Future<Uint8List> Function(int offset, int length) read) async {
+  if (head.length < 2 || head[0] != 255 || head[1] != 216) return null;
+  Future<Uint8List> range(int offset, int length) async {
+    if (offset < 0 || length < 0 || offset + length > fileSize) {
+      throw const FormatException('EXIF range outside object');
+    }
+    if (offset + length <= head.length) return Uint8List.sublistView(head, offset, offset + length);
+    final bytes = await read(offset, length);
+    if (bytes.length != length) throw const FormatException('Short EXIF range');
+    return bytes;
+  }
+  try {
+    var markerOffset = 2;
+    for (var segment = 0; segment < 128; segment++) {
+      final marker = await range(markerOffset, 4);
+      if (marker[0] != 255 || marker[1] == 218 || marker[1] == 217) return null;
+      final length = (marker[2] << 8) | marker[3];
+      if (length < 2) return null;
+      final end = markerOffset + 2 + length;
+      if (end > fileSize) return null;
+      if (marker[1] == 225 && length >= 16) {
+        final signature = await range(markerOffset + 4, 6);
+        if (String.fromCharCodes(signature) == 'Exif\x00\x00') {
+          final base = markerOffset + 10;
+          Future<ByteData> tiff(int offset, int count) async {
+            if (offset < 0 || base + offset + count > end) throw const FormatException('Bad TIFF offset');
+            return ByteData.sublistView(await range(base + offset, count));
+          }
+          final header = await tiff(0, 8);
+          final order = header.getUint16(0);
+          if (order != 0x4949 && order != 0x4d4d) return null;
+          final endian = order == 0x4949 ? Endian.little : Endian.big;
+          if (header.getUint16(2, endian) != 42) return null;
+          final ifd0 = header.getUint32(4, endian);
+          final count0 = (await tiff(ifd0, 2)).getUint16(0, endian);
+          if (count0 > 256) return null;
+          final table0 = await tiff(ifd0 + 2, count0 * 12 + 4);
+          var orientation = 0;
+          for (var i = 0; i < count0; i++) {
+            final at = i * 12;
+            if (table0.getUint16(at, endian) == 0x112 &&
+                table0.getUint16(at + 2, endian) == 3 && table0.getUint32(at + 4, endian) == 1) {
+              orientation = table0.getUint16(at + 8, endian);
+            }
+          }
+          final ifd1 = table0.getUint32(count0 * 12, endian);
+          if (ifd1 == 0) return null;
+          final count1 = (await tiff(ifd1, 2)).getUint16(0, endian);
+          if (count1 > 256) return null;
+          final table1 = await tiff(ifd1 + 2, count1 * 12);
+          int? offset, bytes;
+          for (var i = 0; i < count1; i++) {
+            final at = i * 12;
+            if (table1.getUint16(at + 2, endian) != 4 || table1.getUint32(at + 4, endian) != 1) continue;
+            final tag = table1.getUint16(at, endian);
+            if (tag == 0x201) offset = table1.getUint32(at + 8, endian);
+            if (tag == 0x202) bytes = table1.getUint32(at + 8, endian);
+          }
+          if (offset == null || bytes == null || bytes < 4 || bytes > 256 * 1024 || base + offset + bytes > end) return null;
+          final jpeg = await range(base + offset, bytes);
+          if (jpeg[0] != 255 || jpeg[1] != 216 || jpeg[bytes - 2] != 255 || jpeg.last != 217) return null;
+          return injectJpegOrientation(jpeg, orientation);
+        }
+      }
+      markerOffset = end;
+    }
+  } on FormatException { return null; }
+  return null;
+}
+
 /// JPEG 是否带 Exif APP1 段(带方向的缩略交给引擎,不再注入)。
 bool jpegHasExif(Uint8List jpeg) => _findExifApp1(jpeg) != null;
 

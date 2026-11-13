@@ -74,7 +74,11 @@ final class BrowserController extends ChangeNotifier {
     notifyListeners();
   }
 
-  Future<void> load() async {
+  bool get hasMoreMetadata => repository is ObjectRepositoryImpl &&
+      (repository as ObjectRepositoryImpl).hasMoreMetadata;
+  Future<void> loadMore() => load(more: true);
+
+  Future<void> load({bool refresh = false, bool more = false}) async {
     if (syncing) {
       return;
     }
@@ -83,7 +87,16 @@ final class BrowserController extends ChangeNotifier {
     progress = null;
     notifyListeners();
     try {
-      final result = await repository.loadAlbums();
+      final repo = repository;
+      final List<CameraAlbum> result;
+      if (more && repo is ObjectRepositoryImpl) {
+        result = await repo.loadMoreMetadata();
+      } else if (refresh && repo is ObjectRepositoryImpl) {
+        result = await repo.refreshAlbums();
+      } else {
+        if (refresh) repo.reset();
+        result = await repo.loadAlbums();
+      }
       // 断连门闩:枚举期间断连的话 _invalidate 已清态,迟到的返回值
       // (reset 后 _loadAll 提前正常返回,_buildAlbums 读到的是清空后的
       // 缓存)不得再覆盖界面。
@@ -101,11 +114,8 @@ final class BrowserController extends ChangeNotifier {
     }
   }
 
-  /// 手动刷新 / 下拉刷新:重置后重新渐进枚举(缩略图磁盘缓存仍在)。
-  Future<void> reload() async {
-    repository.reset();
-    await load();
-  }
+  /// 手动刷新 / 下拉刷新。
+  Future<void> reload() => load(refresh: true);
 
   /// 链路是否在(断连后页面仍展示快照,但下载/删除/刷新必须禁用)。
   bool get linkUp => _linkUp;

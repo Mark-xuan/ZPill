@@ -16,6 +16,7 @@ import '../browser/storage_info.dart';
 import '../log/app_log.dart';
 import '../ptpip/object_info.dart';
 import '../utils/byte_reader.dart';
+import '../utils/priority_work_queue.dart';
 import '../utils/byte_writer.dart';
 import 'device_prop.dart';
 import 'operation_codes.dart';

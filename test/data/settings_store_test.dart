@@ -1,6 +1,8 @@
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:z_pill/core/transfer/z30_transfer_profile.dart';
+
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:z_pill/core/browser/photo_group.dart';
@@ -22,6 +24,7 @@ void main() {
   test('默认设置:文件不存在 → 全默认', () async {
     final s = await store.current();
     expect(s.autoTransfer, isFalse);
+    expect(s.z30TransferProfile, Z30TransferProfile.normal);
     expect(s.autoTransferFormat, PhotoDownloadFormat.both);
     expect(s.quality, TransferQuality.original);
   });
@@ -31,6 +34,7 @@ void main() {
     store.settings.listen(updates.add);
     final next = const AppSettings().copyWith(
       autoTransfer: true,
+      z30TransferProfile: Z30TransferProfile.fixed2048,
       autoTransferFormat: PhotoDownloadFormat.raw,
       batterySaver: true,
       customSavePath: '/tmp/x',

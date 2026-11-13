@@ -137,7 +137,7 @@ final class _FakeThumbs implements ThumbnailCache {
     if (failHandles.contains(entry.handle)) {
       throw Exception('假失败:${entry.name}');
     }
-    final path = '/tmp/zpill_test_thumb_${entry.handle}.jpg';
+    final path = '${Directory.systemTemp.path}/zpill_test_thumb_${entry.handle}.jpg';
     File(path).writeAsBytesSync(_tinyPng);
     return path;
   }
@@ -275,6 +275,41 @@ Future<void> _drainSnackBar(WidgetTester tester) async {
 }
 
 void main() {
+  testWidgets('缩略图按24张分批，触底不自动加载，点击追加下一批', (tester) async {
+    final repo = _FakeRepo();
+    final controller = BrowserController(repository: repo);
+    final thumbs = _FakeThumbs();
+    await tester.pumpWidget(_host(PhotoGridPage(
+      controller: controller,
+      folderHandle: CameraAlbum.allPhotosHandle,
+      thumbnails: thumbs,
+      uiPrefs: InMemoryUiPrefsStore(),
+    )));
+    final albums = [CameraAlbum.allPhotos([
+      for (var i = 1; i <= 60; i++) _photo(i),
+    ])];
+    repo.completeLoad(albums);
+    await tester.pumpAndSettle();
+    final scroll = tester.state<ScrollableState>(find.byType(Scrollable).first);
+    scroll.position.jumpTo(scroll.position.maxScrollExtent);
+    await tester.pumpAndSettle();
+    expect(thumbs.calls.toSet().length, lessThanOrEqualTo(24));
+    expect(find.byKey(const ValueKey('cameraLoadMore')), findsOneWidget);
+    await tester.tap(find.byKey(const ValueKey('cameraLoadMore')));
+    await tester.pumpAndSettle();
+    scroll.position.jumpTo(scroll.position.maxScrollExtent);
+    await tester.pumpAndSettle();
+    expect(thumbs.calls.toSet().length, greaterThan(24));
+    expect(thumbs.calls.toSet().length, lessThanOrEqualTo(48));
+    await tester.drag(find.byType(CustomScrollView), const Offset(0, -180));
+    await tester.pumpAndSettle();
+    scroll.position.jumpTo(scroll.position.maxScrollExtent);
+    await tester.pumpAndSettle();
+    expect(find.byKey(const ValueKey('cameraLoadMore')), findsNothing);
+    await tester.pumpWidget(const SizedBox());
+    controller.dispose();
+  });
+
   testWidgets('渐进增长:新块追加 cell,key 按 handle 复用不漂移', (tester) async {
     final repo = _FakeRepo();
     final controller = BrowserController(repository: repo);
@@ -1370,7 +1405,7 @@ void main() {
         find.byWidgetPredicate((w) =>
             w is Image &&
             w.image ==
-                FileImage(File('/tmp/zpill_test_thumb_1.jpg'))),
+                FileImage(File('${Directory.systemTemp.path}/zpill_test_thumb_1.jpg'))),
         findsOneWidget);
 
     // 收查看器:配对件仍在两侧,回程航班落回格位。

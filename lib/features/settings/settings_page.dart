@@ -13,6 +13,7 @@ import '../../app_services.dart';
 import '../../core/browser/photo_group.dart';
 import '../../core/log/app_log.dart';
 import '../../core/media/watermark.dart';
+import '../../core/transfer/z30_transfer_profile.dart';
 import '../../data/settings_store.dart';
 import '../../design/app_colors.dart';
 import '../../design/app_dimens.dart';
@@ -69,6 +70,9 @@ class SettingsController extends ChangeNotifier
   /// 界面语言(i18n 第一期):选中即存,app 根沿重建 L10nScope。
   Future<void> setLanguage(AppLanguage value) =>
       _update(settings.copyWith(language: value));
+
+  Future<void> setZ30TransferProfile(Z30TransferProfile value) =>
+      _update(settings.copyWith(z30TransferProfile: value));
 
   Future<void> setAutoTransfer(bool value) =>
       _update(settings.copyWith(autoTransfer: value));
@@ -396,6 +400,26 @@ class _SettingsPageState extends State<SettingsPage> {
     );
   }
 
+  Future<void> _chooseZ30TransferProfile(
+      BuildContext context, SettingsController controller) async {
+    final selected = await showDialog<Z30TransferProfile>(
+      context: context,
+      builder: (context) => SimpleDialog(
+        title: Text(context.t('settings.z30TransferProfile')),
+        children: [
+          for (final profile in Z30TransferProfile.values)
+            SimpleDialogOption(
+              onPressed: () => Navigator.of(context).pop(profile),
+              child: Text(context.t('settings.z30Profile.${profile.name}')),
+            ),
+        ],
+      ),
+    );
+    if (selected != null && mounted) {
+      await controller.setZ30TransferProfile(selected);
+    }
+  }
+
   Widget _transferSection(BuildContext context, SettingsController controller) {
     final s = controller.settings;
     return SettingsSection(
@@ -422,6 +446,13 @@ class _SettingsPageState extends State<SettingsPage> {
             ],
             onChanged: controller.setAutoTransferFormat,
           ),
+        ),
+        SettingsRow(
+          leading: Icons.speed,
+          title: context.t('settings.z30TransferProfile'),
+          subtitle: '${context.t('settings.z30Profile.${s.z30TransferProfile.name}')} · '
+              '${context.t('settings.z30ProfileRestart')}',
+          onTap: () => _chooseZ30TransferProfile(context, controller),
         ),
         SettingsRow(
           leading: Icons.high_quality_outlined,

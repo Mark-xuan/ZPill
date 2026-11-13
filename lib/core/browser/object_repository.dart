@@ -2,6 +2,7 @@
 library;
 
 import 'dart:async';
+import '../utils/priority_work_queue.dart';
 import 'dart:math' as math;
 
 import '../ptpip/object_format.dart';
@@ -12,6 +13,7 @@ import '../ptp/ptp_transport.dart';
 import '../log/app_log.dart';
 import '../media/video_rating.dart';
 import '../media/video_duration.dart';
+import '../media/watermark.dart' show exifCardFromHead;
 import '../utils/byte_reader.dart';
 import '../utils/byte_writer.dart';
 import 'album.dart';
@@ -237,7 +239,11 @@ abstract interface class ObjectRepository {
 /// 会话关闭/重连后必须 [reset](AppServices 订阅连接状态驱动),否则句柄
 /// 可能已过期。
 final class ObjectRepositoryImpl implements ObjectRepository {
-  ObjectRepositoryImpl({required this.session, this.chunkSize = 24}) {
+  ObjectRepositoryImpl({
+    required this.session,
+    this.chunkSize = 24,
+    this.allowJpegReadFallback,
+  }) {
     // 拍照即现身:相机落卡 → ObjectAdded(0x4002,中断通道与 0x941C
     // 轮询均汇入 session.events)→ 拉该对象 ObjectInfo 入缓存并广播,
     // 相册免手动刷新(2026-10-16 用户复报「拍的照片要刷新才出现」;
@@ -256,12 +262,14 @@ final class ObjectRepositoryImpl implements ObjectRepository {
     if (event.params.isEmpty) return;
     final handle = event.params.first;
     if (_byHandle.containsKey(handle)) return; // 重复事件:已缓存不重拉
+    _nonJpegHandles.remove(handle);
     final gen = _generation;
     unawaited(() async {
       try {
-        final info = await session.getObjectInfo(handle);
+        final entry = await _readEntry(handle);
+        if (entry == null) return;
         if (gen != _generation) return; // reset 竞态:弃
-        _byHandle[handle] = ObjectRepository.toEntry(info);
+        _byHandle[handle] = entry;
         _groupIndexOf = null;
         _albumsCache = null;
         // 枚举进行中不另发布(其分块广播读活缓存,新对象自然带上);
@@ -276,6 +284,7 @@ final class ObjectRepositoryImpl implements ObjectRepository {
   }
 
   final PtpSession session;
+  final bool Function()? allowJpegReadFallback;
 
   /// 0x4007 ObjectInfoChanged(§6.4.1.7):对象信息变化(相机侧改评是
   /// 其一;是否真发未证)。best-effort 重拉该对象评级 —— 相机→App
@@ -323,6 +332,7 @@ final class ObjectRepositoryImpl implements ObjectRepository {
   /// 一张一张拉。JPEG 成功即缓存+合并发布;NEF/拒答形态记入
   /// [_ratingQueried] 不再重试;失败不抛(评级是加菜)。
   Future<bool> _fetchRating(int handle, {bool force = false}) async {
+    if (_byHandle[handle]?.requiresExtendedRead == true) return false;
     if (!force && !_ratingQueried.add(handle)) return false;
     if (!_ratingInFlight.add(handle)) return false;
     final gen = _generation;
@@ -407,7 +417,7 @@ final class ObjectRepositoryImpl implements ObjectRepository {
   @override
   void requestRating(int handle, {bool trashProbe = true}) {
     final entry = _byHandle[handle];
-    if (entry == null || entry.isFolder) return;
+    if (entry == null || entry.isFolder || entry.requiresExtendedRead) return;
     switch (entry.kind) {
       case ObjectKind.video:
         unawaited(() async {
@@ -437,7 +447,7 @@ final class ObjectRepositoryImpl implements ObjectRepository {
   @override
   void requestTrashProbe(int handle) {
     final entry = _byHandle[handle];
-    if (entry == null || entry.isFolder) return;
+    if (entry == null || entry.isFolder || entry.requiresExtendedRead) return;
     if (entry.kind != ObjectKind.image) return;
     unawaited(() async {
       // 驻留沿可能与轻量段 fetch 在途撞车:_detectTrashViaXmp 先登记
@@ -533,6 +543,7 @@ final class ObjectRepositoryImpl implements ObjectRepository {
   Stream<AlbumsUpdate> get updates => _updatesCtrl.stream;
 
   Map<int, ObjectEntry> _byHandle = <int, ObjectEntry>{};
+  final Set<int> _nonJpegHandles = <int>{};
   bool _loaded = false;
 
   /// 相机评级缓存(句柄 → 0-5 星;0 = 未评/未知)。真源 = 相机
@@ -674,6 +685,23 @@ final class ObjectRepositoryImpl implements ObjectRepository {
     return _albumsSnapshot();
   }
 
+  int _metadataLimit = 24;
+  bool hasMoreMetadata = false;
+  Future<List<CameraAlbum>> loadMoreMetadata() {
+    _metadataLimit += 24;
+    _loaded = false;
+    return loadAlbums();
+  }
+
+  Future<List<CameraAlbum>> refreshAlbums() {
+    if (allowJpegReadFallback?.call() == true) {
+      _loaded = false;
+    } else {
+      reset();
+    }
+    return loadAlbums();
+  }
+
   @override
   Future<ObjectEntry> entryFor(int handle) async {
     await _ensureLoaded();
@@ -687,8 +715,11 @@ final class ObjectRepositoryImpl implements ObjectRepository {
   /// 丢弃缓存(断开/失败后由连接状态监听调用;重连后首次加载重枚举)。
   @override
   void reset() {
+    _metadataLimit = 24;
+    hasMoreMetadata = false;
     _generation++;
     _byHandle = <int, ObjectEntry>{};
+    _nonJpegHandles.clear();
     _groupIndexOf = null;
     _albumsCache = null;
     _ratings.clear();
@@ -714,6 +745,7 @@ final class ObjectRepositoryImpl implements ObjectRepository {
   void removeHandles(Iterable<int> handles) {
     var removed = false;
     for (final h in handles.toSet()) {
+      _nonJpegHandles.remove(h);
       if (_byHandle.remove(h) != null) {
         removed = true;
         _videoDurations.remove(h);
@@ -733,7 +765,7 @@ final class ObjectRepositoryImpl implements ObjectRepository {
     if (_loaded) return Future.value();
     final pending = _loading;
     if (pending != null) return pending;
-    final load = _loadAll();
+    final load = PriorityWorkQueue.background(_loadAll);
     _loading = load;
     // 失败也要清标志,下次调用重试;reset 已换新 _loading 时不覆盖。
     return load.whenComplete(() {
@@ -741,6 +773,45 @@ final class ObjectRepositoryImpl implements ObjectRepository {
         _loading = null;
       }
     });
+  }
+
+  Future<ObjectEntry?> _readEntry(int handle) async {
+    try {
+      return ObjectRepository.toEntry(await session.getObjectInfo(handle));
+    } on PtpResponseException catch (error) {
+      if (error.responseCode != PtpResponseCode.accessDenied ||
+          allowJpegReadFallback?.call() != true) {
+        rethrow;
+      }
+      final int size;
+      try {
+        size = await session.getObjectSize(handle);
+      } on PtpResponseException catch (error) {
+        // GetObjectHandles also includes directories, which have no file size.
+        if (error.responseCode == PtpResponseCode.invalidParameter) return null;
+        rethrow;
+      }
+      if (size <= 0) return null;
+      final head =
+          await session.getObjectHead(handle, math.min(size, 4096));
+      if (head.length < 3 ||
+          head[0] != 0xFF ||
+          head[1] != 0xD8 ||
+          head[2] != 0xFF) {
+        return null;
+      }
+      final serial = session.cachedDeviceInfo?.serialNumber ?? 'camera';
+      final label = serial.replaceAll(RegExp(r'[^A-Za-z0-9_-]'), '_');
+      return ObjectEntry(
+        handle: handle,
+        name: 'Z30_${label}_${handle.toRadixString(16)}.JPG',
+        sizeInBytes: size,
+        kind: ObjectKind.image,
+        formatCode: ObjectFormatCode.exifJpeg,
+        capturedAt: exifCardFromHead(head)?.takenAt,
+        requiresExtendedRead: true,
+      );
+    }
   }
 
   /// 全量枚举(渐进,分页快路):GetObjectHandles(Zf 语义 parent=0)
@@ -754,6 +825,7 @@ final class ObjectRepositoryImpl implements ObjectRepository {
     final generation = _generation;
     // Zf 把 0 与 0xFFFFFFFF 的语义做反了:parent 必须传 0 才是全量。
     final handles = await session.getObjectHandles();
+    if (generation != _generation) return;
     // 最新优先(2026-10-02 Zf 实测):GetObjectHandles 线序 =
     // [文件夹][slot-1 照片升序][slot-2 照片升序],槽内句柄升序=拍摄顺序
     // (双槽各对拍 40 条验证)。倒序让最新照片在首个块亮相,文件夹对象
@@ -762,10 +834,12 @@ final class ObjectRepositoryImpl implements ObjectRepository {
     // 同会话内已删除的对象清出缓存防幽灵;已缓存对象跳过(断点续传)。
     final handleSet = handles.toSet();
     _byHandle.removeWhere((h, _) => !handleSet.contains(h));
+    _nonJpegHandles.retainAll(handleSet);
+    _groupIndexOf = null;
     _albumsCache = null; // 幽灵清理改变对象表:快照重派生
     final pending = [
       for (final h in ordered)
-        if (!_byHandle.containsKey(h)) h,
+        if (!_byHandle.containsKey(h) && !_nonJpegHandles.contains(h)) h,
     ];
     var loaded = ordered.length - pending.length;
 
@@ -851,13 +925,18 @@ final class ObjectRepositoryImpl implements ObjectRepository {
       _publish(loaded, ordered.length, complete: false);
     }
     var consecutiveFailures = 0;
+    metadataPages:
     for (var start = 0; start < gaps.length; start += chunkSize) {
       final end = math.min(start + chunkSize, gaps.length);
       for (var i = start; i < end; i++) {
+        if (allowJpegReadFallback?.call() == true &&
+            _byHandle.values.where((e) => !e.isFolder).length >= _metadataLimit) {
+          break metadataPages;
+        }
         final handle = gaps[i];
-        final PtpObjectInfo info;
+        final ObjectEntry? entry;
         try {
-          info = await session.getObjectInfo(handle);
+          entry = await _readEntry(handle);
         } on PtpResponseException {
           // 相机明确拒答单个对象(如同刻被删):跳过继续;连续 3 个失败
           // 视为会话级拒绝,上抛终止本轮(防空转数百次)。传输层/看门狗
@@ -869,22 +948,34 @@ final class ObjectRepositoryImpl implements ObjectRepository {
         }
         consecutiveFailures = 0;
         if (generation != _generation) return; // 每个 await 后、写缓存前
-        _byHandle[handle] = ObjectRepository.toEntry(info);
-        _groupIndexOf = null;
-        _albumsCache = null;
         loaded++;
+        if (entry != null) {
+          _byHandle[handle] = entry;
+          _groupIndexOf = null;
+          _albumsCache = null;
+          if (entry.requiresExtendedRead && loaded == 1) {
+            _publish(loaded, ordered.length, complete: false);
+          }
+        } else {
+          _nonJpegHandles.add(handle);
+        }
       }
       if (generation != _generation) return;
       _publish(loaded, ordered.length, complete: false);
     }
     if (generation != _generation) return;
+    hasMoreMetadata = allowJpegReadFallback?.call() == true &&
+        ordered.any((h) => !_byHandle.containsKey(h) && !_nonJpegHandles.contains(h));
+    AppLog.i(AppLog.browser, 'metadata stage limit=$_metadataLimit known=${_byHandle.length} total=${ordered.length} more=$hasMoreMetadata');
     _loaded = true;
     // 完成事件兜底:空相机 / 续传零缺口(块循环没跑)也要有确定终态。
     _publish(loaded, ordered.length, complete: true);
     // 评级同步:0x9434 批量位一发拿全卡「有无星」(SnapBridge 同款
     // 通道,NEF 也在内),有星的适用格式再逐张 0x9803 拉档位 ——
     // 无星的绝大多数对象零事务(不 await,不挡本 Future)。
-    unawaited(_syncRatingsViaMeta(generation));
+    if (!_byHandle.values.any((entry) => entry.requiresExtendedRead)) {
+      unawaited(_syncRatingsViaMeta(generation));
+    }
   }
 
   /// 评级主同步路:0x9434 位图 → 逐张档位补拉。起步延 500ms(枚举沿
@@ -963,6 +1054,7 @@ final class ObjectRepositoryImpl implements ObjectRepository {
   /// 星档(顺手收);无元素 = 不可判,保持无评级态。
   /// 返回是否写入新数据(调用方据此决定发不发更新 —— 空转不发)。
   Future<bool> _detectTrashViaXmp(int handle) async {
+    if (_byHandle[handle]?.requiresExtendedRead == true) return false;
     if (!_trashProbed.add(handle)) return false;
     if (!_ratingInFlight.add(handle)) return false;
     final gen = _generation;

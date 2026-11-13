@@ -4,6 +4,9 @@
 /// 相等(catalog_integrity_test 强制)。文案的取用走 l10n.dart 的
 /// t():查键得文案,未命中直通键本身(运行期动态串原样透出)。
 const Map<String, String> zhCatalog = {
+  'grid.loadMoreMetadata': '继续上拉或点击加载更多（仅对已读取照片排序）',
+  'grid.loadingMore': '正在读取下一批…（排序仅针对已读取照片）',
+  'grid.loadMore': '继续上拉或点击加载更多',
   'common.followSystem': '跟随系统',
   'lang.zh': '中文',
   'lang.en': 'English',
@@ -11,6 +14,13 @@ const Map<String, String> zhCatalog = {
   'common.done': '完成',
   'common.all': '全部',
   'settings.sectionCapture': '拍摄与监看',
+  'settings.z30TransferProfile': 'Z30 STA 下载档位',
+  'settings.z30ProfileRestart': '重启应用后生效',
+  'settings.z30Profile.normal': '常规（256–512 KiB，启用缓存）',
+  'settings.z30Profile.fixed512': '512 KiB',
+  'settings.z30Profile.fixed1024': '1 MiB',
+  'settings.z30Profile.fixed2048': '2 MiB',
+  'settings.z30Profile.highspeed': '高速读取（1 MiB）',
   'settings.sectionTransfer': '传输与存储',
   'settings.sectionAppearance': '应用与外观',
   'settings.sectionDevice': '设备与诊断',

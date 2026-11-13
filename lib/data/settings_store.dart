@@ -9,6 +9,7 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'atomic_json_file.dart';
+import '../core/transfer/z30_transfer_profile.dart';
 import '../core/browser/photo_group.dart';
 import '../core/media/watermark.dart';
 
@@ -76,6 +77,7 @@ const kDeSqueezePresets = [1.0, 1.3, 1.5, 1.6, 2.0];
 final class AppSettings {
   const AppSettings({
     this.autoTransfer = false,
+    this.z30TransferProfile = Z30TransferProfile.normal,
     this.autoTransferFormat = PhotoDownloadFormat.both,
     this.quality = TransferQuality.original,
     this.batterySaver = false,
@@ -122,6 +124,7 @@ final class AppSettings {
 
   /// 速传(ObjectAdded 自动下载)的格式过滤:双格式照片组按此选文件。
   final PhotoDownloadFormat autoTransferFormat;
+  final Z30TransferProfile z30TransferProfile;
 
   final TransferQuality quality; // P3:传输质量(压缩路径未实现,暂不消费)
   final bool batterySaver; // P3:省电模式(未消费)
@@ -257,6 +260,7 @@ final class AppSettings {
   AppSettings copyWith({
     bool? autoTransfer,
     PhotoDownloadFormat? autoTransferFormat,
+    Z30TransferProfile? z30TransferProfile,
     TransferQuality? quality,
     bool? batterySaver,
     String? customSavePath,
@@ -300,6 +304,7 @@ final class AppSettings {
       AppSettings(
         autoTransfer: autoTransfer ?? this.autoTransfer,
         autoTransferFormat: autoTransferFormat ?? this.autoTransferFormat,
+        z30TransferProfile: z30TransferProfile ?? this.z30TransferProfile,
         quality: quality ?? this.quality,
         batterySaver: batterySaver ?? this.batterySaver,
         customSavePath: customSavePath ?? this.customSavePath,
@@ -351,6 +356,7 @@ final class AppSettings {
       other is AppSettings &&
       other.autoTransfer == autoTransfer &&
       other.autoTransferFormat == autoTransferFormat &&
+      other.z30TransferProfile == z30TransferProfile &&
       other.quality == quality &&
       other.batterySaver == batterySaver &&
       other.customSavePath == customSavePath &&
@@ -394,7 +400,7 @@ final class AppSettings {
   @override
   // Object.hash 位置参上限 20,字段 37 个 → hashAll(列表序即上面 == 序)。
   int get hashCode => Object.hashAll([
-        autoTransfer, autoTransferFormat, quality, batterySaver, customSavePath,
+        autoTransfer, autoTransferFormat, z30TransferProfile, quality, batterySaver, customSavePath,
         themeMode, language, xmpCreator, xmpRights, xmpInjectRating, xmpInjectGps,
         watermarkStyle, watermarkText, feedUpscaler, temporalDenoise,
         autoRotateFeed, deSqueeze,
@@ -410,6 +416,7 @@ final class AppSettings {
 
   Map<String, Object?> toJson() => {
         'autoTransfer': autoTransfer,
+        'z30TransferProfile': z30TransferProfile.name,
         'autoTransferFormat': autoTransferFormat.name,
         'quality': quality.name,
         'batterySaver': batterySaver,
@@ -456,6 +463,9 @@ final class AppSettings {
 
   static AppSettings fromJson(Map<String, Object?> json) => AppSettings(
         autoTransfer: json['autoTransfer'] == true,
+        z30TransferProfile: _enumByName(
+                Z30TransferProfile.values, json['z30TransferProfile']) ??
+            Z30TransferProfile.normal,
         autoTransferFormat:
             _enumByName(PhotoDownloadFormat.values, json['autoTransferFormat'])
                 ?? PhotoDownloadFormat.both,

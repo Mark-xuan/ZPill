@@ -6,6 +6,9 @@
 ///
 /// 「中文」在英文环境也显示「中文」—— 语言专名,不译。
 const Map<String, String> enCatalog = {
+  'grid.loadMoreMetadata': 'Pull up or tap for more (sorting loaded photos only)',
+  'grid.loadingMore': 'Reading next batch… (sorting applies to loaded photos)',
+  'grid.loadMore': 'Pull up again or tap to load more',
   'common.followSystem': 'Follow System',
   'lang.zh': '中文',
   'lang.en': 'English',
@@ -13,6 +16,13 @@ const Map<String, String> enCatalog = {
   'common.done': 'Done',
   'common.all': 'All',
   'settings.sectionCapture': 'Capture & monitoring',
+  'settings.z30TransferProfile': 'Z30 STA download profile',
+  'settings.z30ProfileRestart': 'Restart the app to apply',
+  'settings.z30Profile.normal': 'Normal (256–512 KiB, cached)',
+  'settings.z30Profile.fixed512': '512 KiB',
+  'settings.z30Profile.fixed1024': '1 MiB',
+  'settings.z30Profile.fixed2048': '2 MiB',
+  'settings.z30Profile.highspeed': 'High speed (1 MiB)',
   'settings.sectionTransfer': 'Transfer & storage',
   'settings.sectionAppearance': 'App & appearance',
   'settings.sectionDevice': 'Device & diagnostics',

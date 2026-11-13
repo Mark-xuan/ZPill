@@ -230,7 +230,7 @@ final class CameraConnectionImpl implements CameraConnection {
 
   /// 最近一次成功连接的档案(无线 = IP/实例名;USB = ip:null)。
   /// connected 断链后据此选路自动重连;手动 disconnect 清空。
-  ({String? ip, String? instanceName})? _lastGood;
+  ({String? ip, String? instanceName, bool rememberIp})? _lastGood;
 
   /// 当前连接是否由恢复循环建立:DROP 记账口径 =「恢复建立的连接再次
   /// 断链」,首断与尝试失败都不计(防秒连秒断风暴把机身 PTP 栈打进
@@ -286,6 +286,13 @@ final class CameraConnectionImpl implements CameraConnection {
 
   @override
   bool get isWireless => _wireless;
+
+  /// JPEG 兼容读取只用于通过 STA 入口建立的 Z30 会话。
+  bool get isZ30Sta {
+    final model = _deviceModel?.toUpperCase().replaceAll(RegExp(r"\s+"), "");
+    return _lastGood?.rememberIp == true &&
+        (model == "Z30" || model == "NIKONZ30");
+  }
 
   @override
   String? get pairingCode => _pairingCode;
@@ -491,7 +498,7 @@ final class CameraConnectionImpl implements CameraConnection {
           _state == CameraLinkState.failed) {
         return;
       }
-      _lastGood = (ip: ip, instanceName: instanceName);
+      _lastGood = (ip: ip, instanceName: instanceName, rememberIp: rememberIp);
       _setError(null);
       _transition(CameraLinkState.connected);
     } on Exception catch (e) {
@@ -705,7 +712,7 @@ final class CameraConnectionImpl implements CameraConnection {
         _state == CameraLinkState.failed) {
       return;
     }
-    _lastGood = (ip: null, instanceName: null);
+    _lastGood = (ip: null, instanceName: null, rememberIp: false);
     _deviceName = _deviceLabel(info, null);
     _deviceModel = info.model;
     _setError(null);
@@ -987,7 +994,9 @@ final class CameraConnectionImpl implements CameraConnection {
           await _connectUsb(silent: true);
         } else {
           await _connectWireless(profile.ip!,
-              instanceName: profile.instanceName, silent: true);
+              instanceName: profile.instanceName,
+              silent: true,
+              rememberIp: profile.rememberIp);
         }
         // 转正由拨号路径完成(含配对后 60s 窗嵌套全程);aborted(等待
         // 期被外部收口)时状态已处理,不置恢复标记。

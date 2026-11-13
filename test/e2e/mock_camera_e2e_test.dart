@@ -10,11 +10,13 @@
 /// OpenSession → 0x90C2 括号),不引入 USB/配对依赖。
 library;
 
+import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:image/image.dart' as img;
 
+import 'package:z_pill/core/browser/object_repository.dart';
 import 'package:z_pill/core/ptp/operation_codes.dart';
 import 'package:z_pill/core/ptp/ptp_link_router.dart';
 import 'package:z_pill/core/ptp/ptp_session.dart';
@@ -22,6 +24,7 @@ import 'package:z_pill/core/ptp/ptp_transport.dart';
 import 'package:z_pill/core/ptpip/codec.dart';
 import 'package:z_pill/core/ptpip/transport.dart';
 import 'package:z_pill/core/ptpip/object_format.dart';
+import 'package:z_pill/core/transfer/object_downloader.dart';
 
 import '../../tools/mock_camera/mock_camera.dart';
 
@@ -40,9 +43,10 @@ final class _Live {
   final PtpSession session;
 }
 
-Future<MockPtpIpCamera> _boot({int? initFailReason}) async {
+Future<MockPtpIpCamera> _boot(
+    {int? initFailReason, Set<int> deniedOperations = const {}}) async {
   final camera = MockPtpIpCamera(
-    device: MockNikonDevice(objects: _persona),
+    device: MockNikonDevice(objects: _persona, deniedOperations: deniedOperations),
     initFailReason: initFailReason,
   );
   await camera.start(); // 随机口,免冲突
@@ -220,6 +224,103 @@ void main() {
       expect(nef.objectFormat, ObjectFormatCode.undefined);
       final mov = await live.session.getObjectInfo(0x00010004);
       expect(mov.objectFormat, ObjectFormatCode.mp4);
+    });
+
+    test('Z30 STA metadata stages read 24 JPEG entries and preserve earlier entries', () async {
+      final seed = _persona.firstWhere((o) => o.handle == _jpgHandle);
+      final camera = MockPtpIpCamera(device: MockNikonDevice(
+        deniedOperations: {PtpOperationCode.getObjectInfo, NikonOperationCode.getObjectPropList},
+        objects: [for (var i=1;i<=50;i++) MockObject(handle:i,
+          storageId:seed.storageId, format:seed.format, filename:'TEST_$i.JPG',
+          body:seed.body, thumb:seed.thumb, largeThumb:seed.largeThumb,
+          parent:0, captureDate:seed.captureDate)],
+      ));
+      await camera.start(); addTearDown(camera.stop);
+      final live = await _connectAndOpen(camera);
+      final repo = ObjectRepositoryImpl(session:live.session, allowJpegReadFallback:()=>true);
+      await repo.loadAlbums();
+      expect(repo.hasMoreMetadata,isTrue);
+      expect(camera.device.opCounts[PtpOperationCode.getObjectInfo],24);
+      await repo.loadMoreMetadata();
+      expect(camera.device.opCounts[PtpOperationCode.getObjectInfo],48);
+      await repo.refreshAlbums();
+      expect(camera.device.opCounts[PtpOperationCode.getObjectInfo],48);
+      await repo.loadMoreMetadata();
+      expect(camera.device.opCounts[PtpOperationCode.getObjectInfo],50);
+      expect(repo.hasMoreMetadata,isFalse);
+    });
+
+    test('Z30 STA: 枚举成功，接管后读对象信息仍被拒绝', () async {
+      final camera = await _boot(deniedOperations: {
+        NikonOperationCode.getObjectPropList,
+        PtpOperationCode.getObjectInfo,
+        PtpOperationCode.getPartialObject,
+      });
+      final live = await _connectAndOpen(camera);
+
+      expect(await live.session.getObjectHandles(), contains(_jpgHandle));
+      const denied = PtpResponseCode.accessDenied;
+      final accessDenied = isA<PtpResponseException>()
+          .having((error) => error.responseCode, 'responseCode', denied);
+      await expectLater(
+          live.session.getObjectPropList(_folderHandle, depth: 1),
+          throwsA(accessDenied));
+      await expectLater(live.session.getObjectInfo(_jpgHandle),
+          throwsA(accessDenied));
+      await expectLater(live.session.getPartialObject(_jpgHandle, 0, 65536),
+          throwsA(accessDenied));
+
+      await live.session.changeCameraMode(1);
+      expect(camera.device.cameraMode, 1);
+      expect(await live.session.getObjectHandles(), contains(_jpgHandle));
+      await expectLater(live.session.getObjectInfo(_jpgHandle),
+          throwsA(accessDenied));
+    });
+
+    test('未启用 JPEG 兼容时不绕过元数据访问拒绝', () async {
+      final camera = await _boot(deniedOperations: {
+        NikonOperationCode.getObjectPropList,
+        PtpOperationCode.getObjectInfo,
+      });
+      final live = await _connectAndOpen(camera);
+      final repository = ObjectRepositoryImpl(session: live.session);
+      await expectLater(repository.loadAlbums(),
+          throwsA(isA<PtpResponseException>()));
+      expect(camera.device.opCounts[NikonOperationCode.getObjectSize], isNull);
+      expect(camera.device.opCounts[NikonOperationCode.getPartialObjectEx], isNull);
+    });
+
+    test('Z30 STA: 配对会话拒绝标准读卡时列出并完整下载 JPEG', () async {
+      final camera = await _boot(deniedOperations: {
+        NikonOperationCode.getObjectPropList,
+        PtpOperationCode.getObjectInfo,
+        PtpOperationCode.getObject,
+        PtpOperationCode.getPartialObject,
+      });
+      final live = await _connectAndOpen(camera);
+      final repository = ObjectRepositoryImpl(
+        session: live.session,
+        allowJpegReadFallback: () => true,
+      );
+      final albums = await repository.loadAlbums();
+      final entry = await repository.entryFor(_jpgHandle);
+      expect(entry, isNotNull);
+      expect(entry.requiresExtendedRead, isTrue);
+      expect(albums.first.items.expand((group) => group.members)
+          .map((member) => member.handle), isNot(contains(_nefHandle)));
+      final before = Map.of(camera.device.opCounts);
+      await repository.refreshAlbums();
+      expect(camera.device.opCounts, {
+        ...before,
+        PtpOperationCode.getObjectHandles: before[PtpOperationCode.getObjectHandles]! + 1,
+      });
+      final dir = await Directory.systemTemp.createTemp('z30-sta-download-');
+      addTearDown(() => dir.delete(recursive: true));
+      final download = await ObjectDownloader(session: live.session)
+          .download(entry, targetDir: dir.path);
+      expect(await File(download.path).readAsBytes(), camera.device.object(_jpgHandle)!.body);
+      expect(camera.device.opCounts[PtpOperationCode.getObject], isNull);
+      expect(camera.device.opCounts[PtpOperationCode.getPartialObject], isNull);
     });
 
     test('缩略字节:GetThumb / 0x90C4 与 mock 合成逐字节一致且真可解码',

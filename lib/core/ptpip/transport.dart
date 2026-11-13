@@ -134,6 +134,9 @@ final class _Pending {
 
   /// 事务计时(发送沿起跑,响应沿量耗时;Stopwatch 单调,不撞对时跳变)。
   final Stopwatch clock = Stopwatch()..start();
+  int? firstDataUs;
+  int? lastDataUs;
+  int dataChunks = 0;
 
   final completer = Completer<PtpResult>();
   Timer? watchdog;
@@ -588,6 +591,9 @@ final class PtpIpTransport implements PtpTransport, PtpCancelCapable {
         AppLog.d(AppLog.protocol,
             '←数据 tid=$tid +${payload.length}B 头=${AppLog.hex(payload)}');
       }
+      pending.firstDataUs ??= pending.clock.elapsedMicroseconds;
+      pending.lastDataUs = pending.clock.elapsedMicroseconds;
+      pending.dataChunks++;
       pending.feed(payload);
     }
     // 排水字节阀:声明过数据相的事务,实收越过声明 = 相机既不理 Cancel
@@ -653,7 +659,11 @@ final class PtpIpTransport implements PtpTransport, PtpCancelCapable {
     AppLog.i(
         AppLog.protocol,
         '← $op tid=$tid rc=${_hx(packet.responseCode)}'
-        ' ${pending.receivedLength}B ${ms}ms');
+        ' ${pending.receivedLength}B ${ms}ms'
+        ' first_us=${pending.firstDataUs ?? -1}'
+        ' receive_us=${pending.firstDataUs == null ? 0 : pending.lastDataUs! - pending.firstDataUs!}'
+        ' tail_us=${pending.lastDataUs == null ? 0 : pending.clock.elapsedMicroseconds - pending.lastDataUs!}'
+        ' chunks=${pending.dataChunks}');
     pending.completer.complete(PtpResult(
       responseCode: packet.responseCode,
       params: packet.params,

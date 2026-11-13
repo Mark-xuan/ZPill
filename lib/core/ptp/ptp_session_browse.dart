@@ -2,6 +2,41 @@ part of 'ptp_session.dart';
 
 /// 浏览/下载域:对象枚举、存储、缩略、整档/分块下载。
 mixin _BrowseOps on _SessionCore {
+  /// Session-local shared prefix cache, bounded to 128 × 64 KiB.
+  Future<Uint8List> getObjectHead(int handle, int length) async {
+    if (length <= 0 || length > 65536) throw ArgumentError.value(length);
+    final epoch = _headEpoch;
+    final cached = _objectHeads[handle];
+    if (cached != null && cached.length >= length) {
+      _objectHeads.remove(handle);
+      _objectHeads[handle] = cached;
+      AppLog.i(AppLog.browser, 'head hit h=$handle bytes=$length');
+      return Uint8List.sublistView(cached, 0, length);
+    }
+    final pending = _headReads[handle];
+    if (pending != null) {
+      await pending;
+      if (epoch != _headEpoch) throw StateError('Head cache session changed');
+      return getObjectHead(handle, length);
+    }
+    final future = () async {
+      final prefix = _objectHeads[handle] ?? Uint8List(0);
+      final missing = await getPartialObjectEx(handle, prefix.length, length - prefix.length);
+      final bytes = Uint8List.fromList([...prefix, ...missing]);
+      if (epoch == _headEpoch) {
+        _objectHeads.remove(handle);
+        _objectHeads[handle] = bytes;
+        while (_objectHeads.length > 128) { _objectHeads.remove(_objectHeads.keys.first); }
+      }
+      AppLog.i(AppLog.browser, 'head read h=$handle offset=${prefix.length} want=$length got=${bytes.length}');
+      return bytes;
+    }();
+    _headReads[handle] = future;
+    try { return await future; } finally {
+      _headReads.removeWhere((key, value) => key == handle && identical(value, future));
+    }
+  }
+
   bool get largeThumbDegraded => _largeThumbDegraded;
 
   bool get objectPropListDegraded => _objectPropListDegraded;
@@ -67,6 +102,18 @@ mixin _BrowseOps on _SessionCore {
     _ensureOk(result, PtpOperationCode.getObjectInfo);
     return PtpObjectInfo.parse(
         handle: handle, dataset: _requireData(result, 'GetObjectInfo'));
+  }
+
+  /// Nikon GetObjectSize (0x9421) returns the size as a little-endian u64.
+  Future<int> getObjectSize(int handle) async {
+    final result = await _serialized(() => transport.execute(PtpRequest(
+          opcode: NikonOperationCode.getObjectSize,
+          params: [handle],
+        )));
+    _ensureOk(result, NikonOperationCode.getObjectSize);
+    final data = _requireData(result, 'GetObjectSize');
+    if (data.length != 8) throw const FormatException('Invalid GetObjectSize data');
+    return ByteReader(data).u64();
   }
 
   /// DeleteObject(0x100B,标准码):删除相机上的单个对象。
@@ -145,6 +192,63 @@ mixin _BrowseOps on _SessionCore {
     _ensureOk(result, NikonOperationCode.getPartialObjectEx);
     return result.data ?? Uint8List(0);
   }
+
+  /// Experimental sequential transfer: one session lock for setup, all chunks,
+  /// termination and mode restoration. No polling/metadata command can interleave.
+  Future<void> getObjectHighSpeed(int handle, int size, int blockBytes,
+      {required void Function(Uint8List) onData,
+       required bool Function() shouldStop}) => _serialized(() async {
+    var changedMode = false;
+    var attempted = false;
+    var offset = 0;
+    try {
+      final mode = await transport.execute(const PtpRequest(
+          opcode: PtpOperationCode.getDevicePropValue,
+          params: [PtpDevicePropCode.applicationMode]));
+      _ensureOk(mode, PtpOperationCode.getDevicePropValue);
+      final data = _requireData(mode, 'ApplicationMode');
+      if (data.length != 1 || data[0] > 1) throw const FormatException('Unknown application mode');
+      if (data[0] == 0) {
+        final result = await transport.execute(const PtpRequest(
+            opcode: NikonOperationCode.changeApplicationMode, params: [1]));
+        _ensureOk(result, NikonOperationCode.changeApplicationMode);
+        changedMode = true;
+      }
+      while (offset < size && !shouldStop()) {
+        final want = (size - offset) < blockBytes ? size - offset : blockBytes;
+        attempted = true;
+        final result = await transport.execute(PtpRequest(
+            opcode: NikonOperationCode.getPartialObjectHiSpeed,
+            params: [handle, want, 0]));
+        _ensureOk(result, NikonOperationCode.getPartialObjectHiSpeed);
+        final bytes = result.data ?? Uint8List(0);
+        final p = result.params;
+        if (p.length < 3 || p[0] != bytes.length || bytes.isEmpty ||
+            bytes.length > want || ((p[2] << 32) | p[1]) != offset) {
+          throw FormatException('HighSpeed cursor mismatch at $offset');
+        }
+        AppLog.i(AppLog.transfer, 'hs block h=$handle offset=$offset want=$want got=${bytes.length}');
+        onData(bytes);
+        offset += bytes.length;
+      }
+    } finally {
+      try {
+      if (attempted) {
+        final end = await transport.execute(PtpRequest(
+            opcode: NikonOperationCode.getPartialObjectHiSpeed, params: [handle, 0, 1]));
+        AppLog.i(AppLog.transfer, 'hs terminate h=$handle rc=${end.responseCode} offset=$offset');
+        _ensureOk(end, NikonOperationCode.getPartialObjectHiSpeed);
+      }
+      } finally {
+      if (changedMode) {
+        final restore = await transport.execute(const PtpRequest(
+            opcode: NikonOperationCode.changeApplicationMode, params: [0]));
+        AppLog.i(AppLog.transfer, 'hs restore rc=${restore.responseCode}');
+        _ensureOk(restore, NikonOperationCode.changeApplicationMode);
+      }
+      }
+    }
+  });
 
   /// Nikon GetPartialObjectHighSpeed(0x9400,S-SDKZ-200BF §6.2.3.5):
   /// **游标式顺序整档读** —— 参数只有 (ObjectHandle, TransferMaxSize,

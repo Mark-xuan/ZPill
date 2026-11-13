@@ -34,6 +34,7 @@
 library;
 
 import 'dart:async';
+import '../utils/priority_work_queue.dart';
 import 'dart:collection';
 import 'dart:io';
 import 'dart:typed_data';
@@ -207,6 +208,7 @@ class ThumbnailCache {
   /// 返回的 future 在「本次尝试 settle(或被排队顶掉)」后完成,仅供
   /// 测试等待;调用方换图走事件,不等待。
   Future<void> warmPreview(ObjectEntry entry) async {
+    if (entry.requiresExtendedRead) return;
     if (_rawDecoder == null) return; // 无解码器平台(Android/ohos):无高清
     if (entry.kind == ObjectKind.video) return; // 视频海报无高清语义
     final key = _keyFor(entry);
@@ -265,6 +267,7 @@ class ThumbnailCache {
     ThumbSource source, {
     ThumbPriority priority = ThumbPriority.interactive,
   }) {
+    if (entry.requiresExtendedRead) source = ThumbSource.grid;
     final key = _keyFor(entry);
     final lru = _lruFor(source);
     // 命中即刷到 LRU 尾部(最新端);**盘档已无的命中当未命中**(LRU
@@ -326,7 +329,7 @@ class ThumbnailCache {
 
   /// 屏外预取滚入视口时提升排队位置;已开始的相机事务不打断。
   void promote(ObjectEntry entry, ThumbSource source) {
-    _promote((source, _keyFor(entry)));
+    _promote((entry.requiresExtendedRead ? ThumbSource.grid : source, _keyFor(entry)));
   }
 
   void _promote((ThumbSource, String) pendingKey) {
@@ -355,7 +358,7 @@ class ThumbnailCache {
           : _prefetchQueue.removeFirst();
       _activeJob = job;
       try {
-        final path = await _fetch(job.entry, job.source, job.key);
+        final path = await PriorityWorkQueue.background(() => _fetch(job.entry, job.source, job.key));
         if (!job.completer.isCompleted) job.completer.complete(path);
       } on Object catch (e, st) {
         if (!job.completer.isCompleted) job.completer.completeError(e, st);
@@ -379,7 +382,10 @@ class ThumbnailCache {
       Uint8List? head;
       for (final size in const [64 * 1024, 16 * 1024]) {
         try {
-          final chunk = await _session.getPartialObject(entry.handle, 0, size);
+          final chunk = entry.requiresExtendedRead
+              ? await _session.getObjectHead(
+                  entry.handle, entry.sizeInBytes.clamp(1, size).toInt())
+              : await _session.getPartialObject(entry.handle, 0, size);
           if (chunk.isNotEmpty) {
             head = chunk;
             break;
@@ -417,6 +423,9 @@ class ThumbnailCache {
   Future<String> _fetch(
       ObjectEntry entry, ThumbSource source, String key) async {
     final dir = await _dirFor(source);
+    if (entry.requiresExtendedRead) {
+      return _fetchExtendedJpeg(entry, source, key, dir);
+    }
     if (source == ThumbSource.preview) {
       // 高清席位(整档解码)优先:在则直接给高清
       final hqPath = '$dir/hq_$key.jpg';
@@ -504,6 +513,46 @@ class ThumbnailCache {
   void _logFetchError(ObjectEntry entry, ThumbSource source, Object e) {
     AppLog.w(AppLog.browser, '缩略图 $source ${entry.name}'
         '(0x${entry.handle.toRadixString(16)}) 失败: $e');
+  }
+
+  /// Read the EXIF thumbnail first; download the JPEG if it has no thumbnail.
+  Future<String> _fetchExtendedJpeg(
+      ObjectEntry entry, ThumbSource source, String key, String dir) async {
+    final file = File('$dir/$key.jpg');
+    if (!await file.exists()) {
+      final head = await _session.getObjectHead(
+          entry.handle, entry.sizeInBytes.clamp(1, 4096).toInt());
+      final thumbnail = jpegEmbeddedThumbnail(head) ??
+          await readEmbeddedJpegThumbnail(head, entry.sizeInBytes, (offset, length) {
+            AppLog.i(AppLog.browser, 'exif thumbnail range h=${entry.handle} offset=$offset length=$length');
+            return _session.getPartialObjectEx(entry.handle, offset, length);
+          });
+      AppLog.i(AppLog.browser, 'thumbnail h=${entry.handle} source=${thumbnail == null ? "original" : "exif"}');
+      if (thumbnail != null) {
+        await file.writeAsBytes(thumbnail);
+      } else {
+        final download = await _downloader.download(entry,
+            targetDir: await _gallery.tempDir());
+        final original = File(download.path);
+        try {
+          final decoder = _rawDecoder;
+          if (decoder != null) {
+            final jpeg = await decoder.decodeJpeg(
+              original.path,
+              maxPixelSize: source == ThumbSource.grid ? 512 : previewMaxPixelSize,
+            );
+            await file.writeAsBytes(jpeg);
+          } else {
+            await original.copy(file.path);
+          }
+        } finally {
+          await original.delete();
+        }
+      }
+    }
+    _remember(source, key, file.path, await file.length());
+    await _evictIfNeeded(source);
+    return file.path;
   }
 
   /// JPG 取数(网格档与大图预览小图席位共用):Nikon 0x90C4 高清缩略

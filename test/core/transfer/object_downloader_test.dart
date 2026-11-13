@@ -39,6 +39,75 @@ void main() {
   ObjectDownloader downloaderFor(FakePtpTransport fake) =>
       ObjectDownloader(session: PtpSession(transport: fake));
 
+  test('完整原图缓存合并并发请求，消费者修改或删除副本不污染原图', () async {
+    final fake = FakePtpTransport()..reply(_okData(Uint8List.fromList([1, 2, 3])));
+    final downloader = ObjectDownloader(
+      session: PtpSession(transport: fake),
+      originalCacheDir: () async => '${dir.path}/originals',
+    );
+    const entry = ObjectEntry(handle: 1, name: 'Z30.JPG', sizeInBytes: 3,
+        kind: ObjectKind.image, requiresExtendedRead: true);
+    final results = await Future.wait([
+      downloader.download(entry, targetDir: dir.path),
+      downloader.download(entry, targetDir: dir.path),
+    ]);
+    expect(fake.requests.length, 1);
+    expect(results[0].path, isNot(results[1].path));
+    await File(results[0].path).delete();
+    await File(results[1].path).writeAsBytes([9, 9, 9]);
+    final hit = await downloader.download(entry, targetDir: dir.path);
+    expect(await File(hit.path).readAsBytes(), [1, 2, 3]);
+    expect(hit.elapsed, Duration.zero);
+    expect(hit.fromCache, isTrue);
+    expect(fake.requests.length, 1);
+  });
+
+  test('原图缓存在会话变化、文件截断和容量淘汰后重新读取', () async {
+    final fake = FakePtpTransport();
+    var epoch = 0;
+    final downloader = ObjectDownloader(
+      session: PtpSession(transport: fake),
+      originalCacheDir: () async => '${dir.path}/originals',
+      originalCacheEpoch: () => epoch,
+      originalCacheLimitBytes: 4,
+    );
+    ObjectEntry entry(int handle) => ObjectEntry(handle: handle,
+        name: 'Z30_$handle.JPG', sizeInBytes: 3,
+        kind: ObjectKind.image, requiresExtendedRead: true);
+    for (final handle in [1, 2, 1]) {
+      fake.reply(_okData(Uint8List.fromList([handle, 2, 3])));
+      await downloader.download(entry(handle), targetDir: dir.path);
+    }
+    expect(fake.requests.length, 3);
+    epoch++;
+    fake.reply(_okData(Uint8List.fromList([4, 5, 6])));
+    final fresh = await downloader.download(entry(1), targetDir: dir.path);
+    expect(await File(fresh.path).readAsBytes(), [4, 5, 6]);
+    await File('${dir.path}/originals/1_3.jpg').writeAsBytes([0]);
+    fake.reply(_okData(Uint8List.fromList([7, 8, 9])));
+    final repaired = await downloader.download(entry(1), targetDir: dir.path);
+    expect(await File(repaired.path).readAsBytes(), [7, 8, 9]);
+    expect(fake.requests.length, 5);
+  });
+
+  test('失败不入原图缓存，取消的缓存消费者不产生文件或新事务', () async {
+    final fake = FakePtpTransport()
+      ..reply(const PtpResult(responseCode: PtpResponseCode.accessDenied));
+    final downloader = ObjectDownloader(session: PtpSession(transport: fake),
+        originalCacheDir: () async => '${dir.path}/originals');
+    const entry = ObjectEntry(handle: 1, name: 'Z30.JPG', sizeInBytes: 3,
+        kind: ObjectKind.image, requiresExtendedRead: true);
+    await expectLater(downloader.download(entry, targetDir: dir.path),
+        throwsA(isA<PtpResponseException>()));
+    fake.reply(_okData(Uint8List.fromList([1, 2, 3])));
+    await downloader.download(entry, targetDir: dir.path);
+    final count = await dir.list().length;
+    await expectLater(downloader.download(entry, targetDir: dir.path,
+        isCancelled: () => true), throwsA(isA<DownloadCancelledException>()));
+    expect(await dir.list().length, count);
+    expect(fake.requests.length, 2);
+  });
+
   test('流式落盘:文件字节逐一相符,进度按块回调,测速字段非零', () async {
     final fake = FakePtpTransport();
     final downloader = downloaderFor(fake);
@@ -606,6 +675,66 @@ void main() {
                 initialBytes: 64,
                 fastThreshold: const Duration(days: 1)),
       );
+
+  test('Z30 STA: 大块被拒后从同一偏移以 64 KiB 完成下载', () async {
+    const blockBytes = 64 * 1024;
+    const entry = ObjectEntry(
+      handle: 0x12,
+      name: 'Z30.JPG',
+      sizeInBytes: 4 * blockBytes,
+      kind: ObjectKind.image,
+      requiresExtendedRead: true,
+    );
+    final fake = FakePtpTransport();
+    fake.fail(const PtpResponseException(
+      opcode: NikonOperationCode.getPartialObjectEx,
+      responseCode: PtpResponseCode.invalidParameter,
+    ));
+    for (var i = 0; i < 4; i++) {
+      fake.reply(_okData(Uint8List(blockBytes)..fillRange(0, blockBytes, i)));
+    }
+
+    final result =
+        await downloaderFor(fake).download(entry, targetDir: dir.path);
+
+    expect(fake.requests.map((r) => r.opcode),
+        List.filled(5, NikonOperationCode.getPartialObjectEx));
+    expect(fake.requests.map((r) => r.params), [
+      [entry.handle, 0, 0, 4 * blockBytes, 0],
+      [entry.handle, 0, 0, blockBytes, 0],
+      [entry.handle, blockBytes, 0, blockBytes, 0],
+      [entry.handle, 2 * blockBytes, 0, blockBytes, 0],
+      [entry.handle, 3 * blockBytes, 0, blockBytes, 0],
+    ]);
+    final downloaded = await File(result.path).readAsBytes();
+    expect(downloaded.length, entry.sizeInBytes);
+    expect(downloaded, List.generate(entry.sizeInBytes, (i) => i ~/ blockBytes));
+  });
+
+  test('Z30 STA: 从 256 KiB 起步，快块增至 512 KiB', () async {
+    const kib = 1024;
+    const entry = ObjectEntry(
+      handle: 0x12,
+      name: 'Z30.JPG',
+      sizeInBytes: 1024 * kib,
+      kind: ObjectKind.image,
+      requiresExtendedRead: true,
+    );
+    final fake = FakePtpTransport()
+      ..reply(_okData(Uint8List(256 * kib)))
+      ..reply(_okData(Uint8List(512 * kib)))
+      ..reply(_okData(Uint8List(256 * kib)));
+
+    final result =
+        await downloaderFor(fake).download(entry, targetDir: dir.path);
+
+    expect(result.bytes, entry.sizeInBytes);
+    expect(fake.requests.map((r) => r.params), [
+      [entry.handle, 0, 0, 256 * kib, 0],
+      [entry.handle, 256 * kib, 0, 512 * kib, 0],
+      [entry.handle, 768 * kib, 0, 256 * kib, 0],
+    ]);
+  });
 
   test('Ex 首选:首块即 0x9431,u64 参数低高拆分,AIMD 单独演化', () async {
     final fake = FakePtpTransport();

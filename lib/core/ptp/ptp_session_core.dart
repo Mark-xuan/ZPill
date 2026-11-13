@@ -4,7 +4,7 @@ part of 'ptp_session.dart';
 mixin _SessionCore {
   PtpTransport get transport;
 
-  Future<void> _gate = Future<void>.value();
+  final PriorityWorkQueue _gate = PriorityWorkQueue();
 
   /// 排队告警阈值:取景帧(50ms 一拍)等过这么久基本就是被大事务占着
   /// 锁(整档下载/页枚举)。日志里区分「排队慢」与「链路慢」。
@@ -17,7 +17,7 @@ mixin _SessionCore {
   /// 「取景卡顿」到底是等锁还是等相机,靠这条日志分辨。告警限频 1s。
   Future<T> _serialized<T>(Future<T> Function() op) {
     final queuedAt = DateTime.now();
-    final run = _gate.then((_) {
+    final run = _gate.run(() {
       final waited = DateTime.now().difference(queuedAt);
       if (waited >= queueWarnThreshold) {
         final now = DateTime.now();
@@ -29,8 +29,16 @@ mixin _SessionCore {
       }
       return op();
     });
-    _gate = run.then<void>((_) {}, onError: (_) {});
     return run;
+  }
+
+  final Map<int, Uint8List> _objectHeads = {};
+  final Map<int, Future<Uint8List>> _headReads = {};
+  int _headEpoch = 0;
+  void _clearObjectHeads() {
+    _headEpoch++;
+    _objectHeads.clear();
+    _headReads.clear();
   }
 
   bool _sessionOpen = false;
@@ -130,6 +138,7 @@ mixin _SessionCore {
   final Map<int, bool> protectionOptimistic = {};
 
   Future<void> _openLocked() async {
+    _clearObjectHeads();
     final result = await transport.execute(
       const PtpRequest(
         opcode: PtpOperationCode.openSession,
@@ -173,6 +182,7 @@ mixin _SessionCore {
   /// CloseSession(幂等、尽力而为):相机已拔出时不因清理报错。
   /// 设备级断开由连接层调 transport.close()。
   Future<void> close() async {
+    _clearObjectHeads();
     _remoteModeActive = false; // 链将亡:remote 持有态一律作废(含未开会话的旁路持有)
     _largeThumbDegraded = false; // 链将亡:0x90C4 降级态作废,新链重探
     _objectPropListDegraded = false; // 链将亡:0x9805 降级态作废,新链重探

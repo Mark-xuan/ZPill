@@ -205,6 +205,34 @@ Future<void> _until(bool Function() cond) async {
 }
 
 void main() {
+  test('扩展读取 JPEG 缺内嵌缩略图时使用原图，避免标准缩略请求', () async {
+    final fake = FakePtpTransport()
+      ..reply(_okData(_jpeg))
+      ..reply(_okData(_jpeg));
+    final gallery = FakeGallerySaver();
+    addTearDown(() => gallery.root.delete(recursive: true));
+    final cache = ThumbnailCache(
+      session: PtpSession(transport: fake),
+      gallery: gallery,
+    );
+    final entry = ObjectEntry(
+      handle: 1,
+      name: 'Z30_1.JPG',
+      sizeInBytes: _jpeg.length,
+      kind: ObjectKind.image,
+      requiresExtendedRead: true,
+    );
+
+    final grid = cache.pathFor(entry, ThumbSource.grid);
+    final preview = cache.pathFor(entry, ThumbSource.preview);
+    final path = await grid;
+    expect(await preview, path);
+    await cache.warmPreview(entry);
+    expect(await File(path).readAsBytes(), _jpeg);
+    expect(fake.requests.map((request) => request.opcode),
+        List.filled(2, NikonOperationCode.getPartialObjectEx));
+  });
+
   test('未命中拉取落盘;命中后不再发请求', () async {
     final fake = FakePtpTransport()
       ..reply(_okData(_jpeg)) // 0x90C4 高清(裸)
