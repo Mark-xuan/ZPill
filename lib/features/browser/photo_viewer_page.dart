@@ -150,6 +150,8 @@ class _PhotoViewerPageState extends State<PhotoViewerPage>
   /// 不能搬家,但查看器自身布局可以 —— 同一 UiKitView 随 Scaffold 转横
   /// 填满屏幕,零跳变(与图库查看器同款机制)。
   bool _fullscreen = false;
+  final Set<int> _loadingHighQuality = {};
+  final Set<int> _loadedHighQuality = {};
 
   ThumbnailCache get _thumbnails =>
       widget.thumbnails ?? AppServices.instance.thumbnails;
@@ -187,6 +189,7 @@ class _PhotoViewerPageState extends State<PhotoViewerPage>
   /// GetObjectInfo 是唯一在册真值源(整个浏览器都靠它)。读回写会话
   /// 乐观 Map(读写同账);失败(旧机身拒/无会话)静默保持现状。
   void _readProtectState(PhotoGroup group) {
+    if (group.primary.requiresExtendedRead) return;
     final handle = group.primary.handle;
     final gen = _protectWrites;
     unawaited(() async {
@@ -246,8 +249,70 @@ class _PhotoViewerPageState extends State<PhotoViewerPage>
   /// [ThumbnailCache.warmPreview])。
   void _warmCurrent() {
     final group = widget.items[_index];
-    if (!group.isVideo) {
+    if (group.isVideo) return;
+    if (!group.primary.requiresExtendedRead) {
       unawaited(_thumbnails.warmPreview(group.primary));
+    } else {
+      unawaited(_prepareStaPreview(group.primary));
+    }
+  }
+
+  Future<void> _prepareStaPreview(ObjectEntry entry) async {
+    try {
+      final cached = await _thumbnails.cachedHighQualityPreview(entry);
+      if (!mounted || widget.items[_index].primary.handle != entry.handle) {
+        return;
+      }
+      if (cached != null) {
+        setState(() => _loadedHighQuality.add(entry.handle));
+      } else {
+        if (_loadedHighQuality.contains(entry.handle)) {
+          setState(() => _loadedHighQuality.remove(entry.handle));
+        }
+        if (AppServices.maybeInstance?.settingsController.value
+                .autoStaHighQualityPreview ==
+            true) {
+          await _loadHighQuality(entry, automatic: true);
+        }
+      }
+    } on Exception {
+      // 缓存不可读时保留手动入口。
+    }
+  }
+
+  Future<void> _loadHighQuality(ObjectEntry entry,
+      {bool automatic = false}) async {
+    final handle = entry.handle;
+    if (_loadingHighQuality.contains(handle) ||
+        _loadedHighQuality.contains(handle)) return;
+    setState(() => _loadingHighQuality.add(handle));
+    bool stillWanted() =>
+        mounted && widget.items[_index].primary.handle == handle;
+
+    String? path;
+    try {
+      try {
+        await _thumbnails.pathFor(entry, ThumbSource.preview);
+      } on Exception {
+        // 缩略图失败时仍可单独尝试读取原图。
+      }
+      if (!stillWanted()) return;
+      path = await _thumbnails.loadHighQualityPreview(
+        entry,
+        stillWanted: stillWanted,
+      );
+    } on Exception {
+      // 保留当前缩略图，手动操作可以重试。
+    } finally {
+      if (mounted) {
+        setState(() {
+          _loadingHighQuality.remove(handle);
+          if (path != null) _loadedHighQuality.add(handle);
+        });
+        if (path == null && !automatic && stillWanted()) {
+          _snack('viewer.highQualityFailed');
+        }
+      }
     }
   }
 
@@ -592,6 +657,24 @@ class _PhotoViewerPageState extends State<PhotoViewerPage>
           foregroundColor: AppMedia.onMedia,
           title: Text('${_index + 1} / ${widget.items.length}'),
           actions: [
+            if (group.primary.requiresExtendedRead &&
+                !_loadedHighQuality.contains(group.primary.handle))
+              _loadingHighQuality.contains(group.primary.handle)
+                  ? Tooltip(
+                      message: context.t('viewer.loadingHighQuality'),
+                      child: const Padding(
+                        padding: EdgeInsets.all(14),
+                        child: SizedBox.square(
+                          dimension: 20,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        ),
+                      ),
+                    )
+                  : IconButton(
+                      tooltip: context.t('viewer.loadHighQuality'),
+                      onPressed: () => _loadHighQuality(group.primary),
+                      icon: const Icon(Icons.high_quality_outlined),
+                    ),
             IconButton(
               tooltip: context.t('info.title'),
               onPressed: () => _showInfo(group),
@@ -852,10 +935,21 @@ class _PreviewImage extends StatefulWidget {
 }
 
 class _PreviewImageState extends State<_PreviewImage> {
-  late final Future<String> _future =
-      widget.thumbs.pathFor(widget.entry, ThumbSource.preview);
+  late final Future<String> _future = _initialPreview();
   String? _hqPath; // 高清席位路径(升级事件到即有)
   StreamSubscription<PreviewUpgrade>? _upgrades;
+
+  Future<String> _initialPreview() async {
+    if (widget.entry.requiresExtendedRead) {
+      try {
+        final cached = await widget.thumbs.cachedHighQualityPreview(widget.entry);
+        if (cached != null) return cached;
+      } on Exception {
+        // 高清缓存不可用时仍尝试缩略图。
+      }
+    }
+    return widget.thumbs.pathFor(widget.entry, ThumbSource.preview);
+  }
 
   @override
   void initState() {

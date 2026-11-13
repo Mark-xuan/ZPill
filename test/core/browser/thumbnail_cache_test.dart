@@ -205,15 +205,44 @@ Future<void> _until(bool Function() cond) async {
 }
 
 void main() {
-  test('扩展读取 JPEG 缺内嵌缩略图时使用原图，避免标准缩略请求', () async {
+  test('STA 手动高清失败后可重试，成功后复用缓存', () async {
+    final gallery = FakeGallerySaver();
+    addTearDown(() => gallery.root.delete(recursive: true));
+    final downloader = _FakeDownloader()..failNext = true;
+    final cache = ThumbnailCache(
+      session: PtpSession(transport: FakePtpTransport()),
+      gallery: gallery,
+      downloader: downloader,
+      rawDecoder: _FakeRawDecoder(),
+    );
+    const entry = ObjectEntry(
+      handle: 1,
+      name: 'Z30_1.JPG',
+      sizeInBytes: 100,
+      kind: ObjectKind.image,
+      requiresExtendedRead: true,
+    );
+    await cache.warmPreview(entry);
+    expect(downloader.calls, isEmpty);
+    expect(await cache.loadHighQualityPreview(entry), isNull);
+    final path = await cache.loadHighQualityPreview(entry);
+    expect(path, isNotNull);
+    expect(await cache.cachedHighQualityPreview(entry), path);
+    expect(await cache.loadHighQualityPreview(entry), path);
+    expect(downloader.calls, hasLength(2));
+  });
+
+  test('STA 网格与预览共享请求，缺内嵌缩略图时只下载一次原图', () async {
     final fake = FakePtpTransport()
       ..reply(_okData(_jpeg))
       ..reply(_okData(_jpeg));
     final gallery = FakeGallerySaver();
     addTearDown(() => gallery.root.delete(recursive: true));
+    final decoder = _FakeRawDecoder();
     final cache = ThumbnailCache(
       session: PtpSession(transport: fake),
       gallery: gallery,
+      rawDecoder: decoder,
     );
     final entry = ObjectEntry(
       handle: 1,
@@ -223,8 +252,14 @@ void main() {
       requiresExtendedRead: true,
     );
 
-    final path = await cache.pathFor(entry, ThumbSource.grid);
+    final grid = cache.pathFor(entry, ThumbSource.grid);
+    expect(cache.pathFor(entry, ThumbSource.preview), same(grid));
+    await cache.warmPreview(entry);
+    final path = await grid;
     expect(await File(path).readAsBytes(), _jpeg);
+    expect(await cache.pathFor(entry, ThumbSource.preview), path);
+    expect(await cache.exifCardOf(entry), isNull);
+    expect(decoder.calls, 1);
     expect(fake.requests.map((request) => request.opcode),
         List.filled(2, NikonOperationCode.getPartialObjectEx));
   });

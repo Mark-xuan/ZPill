@@ -31,6 +31,7 @@ import 'package:z_pill/platform/video_player.dart';
 /// 假缩略图:即时返回路径(文件不存在 → Image.file 走占位,无动画挂起)。
 final class _FakeThumbs implements ThumbnailCache {
   final warmed = <ObjectEntry>[];
+  final highQualityRequests = <ObjectEntry>[];
 
   /// 信息底单的 EXIF 桩:handle → 卡;未脚本 = null(无 EXIF)。
   final Map<int, ExifCardData> exifByHandle = {};
@@ -70,6 +71,16 @@ final class _FakeThumbs implements ThumbnailCache {
   @override
   Future<void> warmPreview(ObjectEntry entry) async {
     warmed.add(entry);
+  }
+
+  @override
+  Future<String?> cachedHighQualityPreview(ObjectEntry entry) async => null;
+
+  @override
+  Future<String?> loadHighQualityPreview(ObjectEntry entry,
+      {bool Function()? stillWanted}) async {
+    highQualityRequests.add(entry);
+    return '/tmp/zpill_test_hq_${entry.handle}.jpg';
   }
 
   @override
@@ -387,6 +398,31 @@ final class _FakePtpTransport implements PtpTransport {
 }
 
 void main() {
+  testWidgets('Z30 STA 默认手动加载高清', (tester) async {
+    const entry = ObjectEntry(
+      handle: 101,
+      name: 'Z30.JPG',
+      sizeInBytes: 100,
+      kind: ObjectKind.image,
+      requiresExtendedRead: true,
+    );
+    final thumbnails = _FakeThumbs();
+    await _openViewer(
+        tester,
+        PhotoViewerPage(
+          items: [PhotoGroup([entry])],
+          initialIndex: 0,
+          thumbnails: thumbnails,
+          engine: _FakeEngine(),
+        ));
+
+    expect(thumbnails.highQualityRequests, isEmpty);
+    await tester.tap(find.byTooltip('加载高清'));
+    await tester.pumpAndSettle();
+    expect(thumbnails.highQualityRequests, [entry]);
+    expect(find.byTooltip('加载高清'), findsNothing);
+  });
+
   testWidgets('双格式组:筛选未预定(全部)整组直接入队,不弹面板',
       (tester) async {
     final engine = _FakeEngine();
@@ -1275,7 +1311,8 @@ void main() {
   testWidgets('渐进放大动效:初始页挂配对件且先显格缩略(预览席位未回不转圈)',
       (tester) async {
     // 格缩略真档(动效落点图;席位链 Image 无裸错误道,须可解码)。
-    final thumbPath = '/tmp/zpill_test_hero_thumb_101.jpg';
+    final thumbPath =
+        '${Directory.systemTemp.path}/zpill_test_hero_thumb_101.jpg';
     File(thumbPath).writeAsBytesSync(base64Decode(
         'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=='));
 

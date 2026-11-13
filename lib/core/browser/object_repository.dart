@@ -261,6 +261,7 @@ final class ObjectRepositoryImpl implements ObjectRepository {
     if (event.params.isEmpty) return;
     final handle = event.params.first;
     if (_byHandle.containsKey(handle)) return; // 重复事件:已缓存不重拉
+    _nonJpegHandles.remove(handle);
     final gen = _generation;
     unawaited(() async {
       try {
@@ -414,7 +415,7 @@ final class ObjectRepositoryImpl implements ObjectRepository {
   @override
   void requestRating(int handle, {bool trashProbe = true}) {
     final entry = _byHandle[handle];
-    if (entry == null || entry.isFolder) return;
+    if (entry == null || entry.isFolder || entry.requiresExtendedRead) return;
     switch (entry.kind) {
       case ObjectKind.video:
         unawaited(() async {
@@ -444,7 +445,7 @@ final class ObjectRepositoryImpl implements ObjectRepository {
   @override
   void requestTrashProbe(int handle) {
     final entry = _byHandle[handle];
-    if (entry == null || entry.isFolder) return;
+    if (entry == null || entry.isFolder || entry.requiresExtendedRead) return;
     if (entry.kind != ObjectKind.image) return;
     unawaited(() async {
       // 驻留沿可能与轻量段 fetch 在途撞车:_detectTrashViaXmp 先登记
@@ -540,6 +541,7 @@ final class ObjectRepositoryImpl implements ObjectRepository {
   Stream<AlbumsUpdate> get updates => _updatesCtrl.stream;
 
   Map<int, ObjectEntry> _byHandle = <int, ObjectEntry>{};
+  final Set<int> _nonJpegHandles = <int>{};
   bool _loaded = false;
 
   /// 相机评级缓存(句柄 → 0-5 星;0 = 未评/未知)。真源 = 相机
@@ -681,6 +683,15 @@ final class ObjectRepositoryImpl implements ObjectRepository {
     return _albumsSnapshot();
   }
 
+  Future<List<CameraAlbum>> refreshAlbums() {
+    if (allowJpegReadFallback?.call() == true) {
+      _loaded = false;
+    } else {
+      reset();
+    }
+    return loadAlbums();
+  }
+
   @override
   Future<ObjectEntry> entryFor(int handle) async {
     await _ensureLoaded();
@@ -696,6 +707,7 @@ final class ObjectRepositoryImpl implements ObjectRepository {
   void reset() {
     _generation++;
     _byHandle = <int, ObjectEntry>{};
+    _nonJpegHandles.clear();
     _groupIndexOf = null;
     _albumsCache = null;
     _ratings.clear();
@@ -721,6 +733,7 @@ final class ObjectRepositoryImpl implements ObjectRepository {
   void removeHandles(Iterable<int> handles) {
     var removed = false;
     for (final h in handles.toSet()) {
+      _nonJpegHandles.remove(h);
       if (_byHandle.remove(h) != null) {
         removed = true;
         _videoDurations.remove(h);
@@ -800,6 +813,7 @@ final class ObjectRepositoryImpl implements ObjectRepository {
     final generation = _generation;
     // Zf 把 0 与 0xFFFFFFFF 的语义做反了:parent 必须传 0 才是全量。
     final handles = await session.getObjectHandles();
+    if (generation != _generation) return;
     // 最新优先(2026-10-02 Zf 实测):GetObjectHandles 线序 =
     // [文件夹][slot-1 照片升序][slot-2 照片升序],槽内句柄升序=拍摄顺序
     // (双槽各对拍 40 条验证)。倒序让最新照片在首个块亮相,文件夹对象
@@ -808,10 +822,12 @@ final class ObjectRepositoryImpl implements ObjectRepository {
     // 同会话内已删除的对象清出缓存防幽灵;已缓存对象跳过(断点续传)。
     final handleSet = handles.toSet();
     _byHandle.removeWhere((h, _) => !handleSet.contains(h));
+    _nonJpegHandles.retainAll(handleSet);
+    _groupIndexOf = null;
     _albumsCache = null; // 幽灵清理改变对象表:快照重派生
     final pending = [
       for (final h in ordered)
-        if (!_byHandle.containsKey(h)) h,
+        if (!_byHandle.containsKey(h) && !_nonJpegHandles.contains(h)) h,
     ];
     var loaded = ordered.length - pending.length;
 
@@ -923,6 +939,8 @@ final class ObjectRepositoryImpl implements ObjectRepository {
           if (entry.requiresExtendedRead && loaded == 1) {
             _publish(loaded, ordered.length, complete: false);
           }
+        } else {
+          _nonJpegHandles.add(handle);
         }
       }
       if (generation != _generation) return;

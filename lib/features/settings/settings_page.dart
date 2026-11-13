@@ -73,6 +73,9 @@ class SettingsController extends ChangeNotifier
   Future<void> setAutoTransfer(bool value) =>
       _update(settings.copyWith(autoTransfer: value));
 
+  Future<void> setAutoStaHighQualityPreview(bool value) =>
+      _update(settings.copyWith(autoStaHighQualityPreview: value));
+
   Future<void> setAutoTransferFormat(PhotoDownloadFormat value) =>
       _update(settings.copyWith(autoTransferFormat: value));
 
@@ -407,6 +410,13 @@ class _SettingsPageState extends State<SettingsPage> {
           subtitle: context.t('settings.autoTransferSubtitle'),
           value: s.autoTransfer,
           onChanged: controller.setAutoTransfer,
+        ),
+        SettingsSwitchRow(
+          leading: Icons.high_quality_outlined,
+          title: context.t('settings.autoStaHighQualityPreview'),
+          subtitle: context.t('settings.autoStaHighQualityPreviewSubtitle'),
+          value: s.autoStaHighQualityPreview,
+          onChanged: controller.setAutoStaHighQualityPreview,
         ),
         SettingsControlRow(
           leading: Icons.photo_size_select_large,

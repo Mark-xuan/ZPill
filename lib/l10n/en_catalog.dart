@@ -14,6 +14,9 @@ const Map<String, String> enCatalog = {
   'common.all': 'All',
   'settings.sectionCapture': 'Capture & monitoring',
   'settings.sectionTransfer': 'Transfer & storage',
+  'settings.autoStaHighQualityPreview': 'Auto-load HD previews on Z30 STA',
+  'settings.autoStaHighQualityPreviewSubtitle':
+      'Downloads the original when viewing a photo and caches the HD preview.',
   'settings.sectionAppearance': 'App & appearance',
   'settings.sectionDevice': 'Device & diagnostics',
   'settings.theme': 'Theme',
@@ -787,6 +790,9 @@ const Map<String, String> enCatalog = {
   'viewer.videoLoadFailed':
       'Failed to load the video; check the connection and retry',
   'viewer.loadingPreview': 'Loading preview…',
+  'viewer.loadHighQuality': 'Load HD preview',
+  'viewer.loadingHighQuality': 'Loading HD preview…',
+  'viewer.highQualityFailed': 'Could not load the HD preview. Try again.',
   'viewer.tapPlay': 'Tap play to watch',
   'viewer.previewUnavailable': 'Preview Unavailable',
   'viewer.preparingPlay': 'Preparing to Play',

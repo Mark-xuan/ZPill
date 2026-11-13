@@ -184,7 +184,9 @@ class ThumbnailCache {
   /// 高清预热:在途内容键 / 单槽排队(只留最新)/ 本会话已试(成败
   /// 都记,失败不重试)。
   String? _hqWarming;
-  ObjectEntry? _hqNext;
+  Future<String?>? _hqInFlight;
+  ({ObjectEntry entry, Completer<String?> result, bool Function()? stillWanted})?
+      _hqNext;
   final Set<String> _hqTried = {};
 
   /// 目录格式清空闸(见 [_dirFor]):每目录每实例只扫一次。
@@ -207,55 +209,86 @@ class ThumbnailCache {
   /// 返回的 future 在「本次尝试 settle(或被排队顶掉)」后完成,仅供
   /// 测试等待;调用方换图走事件,不等待。
   Future<void> warmPreview(ObjectEntry entry) async {
+    // STA 兼容对象沿用共享缩略图，打开查看器不在后台抢占整档传输。
+    if (entry.requiresExtendedRead) return;
     if (_rawDecoder == null) return; // 无解码器平台(Android/ohos):无高清
     if (entry.kind == ObjectKind.video) return; // 视频海报无高清语义
     final key = _keyFor(entry);
     if (_hqWarming == key || _hqTried.contains(key)) return;
-    if (_hqWarming == null) {
-      await _startHq(entry, key);
-    } else {
-      _hqNext = entry;
-    }
+    final busy = _hqWarming != null;
+    final result = loadHighQualityPreview(entry);
+    if (!busy) await result;
   }
 
-  Future<void> _startHq(ObjectEntry entry, String key) async {
+  Future<String?> loadHighQualityPreview(ObjectEntry entry,
+      {bool Function()? stillWanted}) {
+    if (_rawDecoder == null || entry.kind == ObjectKind.video) {
+      return Future.value(null);
+    }
+    final key = _keyFor(entry);
+    if (_hqWarming == key) return _hqInFlight!;
+    if (_hqWarming == null) return _runHq(entry, key);
+    final next = _hqNext;
+    if (next != null && _keyFor(next.entry) == key) return next.result.future;
+    next?.result.complete(null);
+    final result = Completer<String?>();
+    _hqNext = (entry: entry, result: result, stillWanted: stillWanted);
+    return result.future;
+  }
+
+  Future<String?> _runHq(ObjectEntry entry, String key) {
     _hqWarming = key;
+    return _hqInFlight = _startHq(entry, key).whenComplete(() {
+      _hqWarming = null;
+      _hqInFlight = null;
+      final next = _hqNext;
+      _hqNext = null;
+      if (next == null) return;
+      if (next.stillWanted?.call() == false) {
+        next.result.complete(null);
+        return;
+      }
+      next.result.complete(_runHq(next.entry, _keyFor(next.entry)));
+    });
+  }
+
+  Future<String?> _startHq(ObjectEntry entry, String key) async {
     _hqTried.add(key);
+    ObjectDownload? dl;
     try {
       final dir = await _dirFor(ThumbSource.preview);
       final path = '$dir/hq_$key.jpg';
-      if (await File(path).exists()) return; // 高清已在(本会话/前会话)
-      ObjectDownload? dl;
-      try {
-        dl = await _downloader.download(entry,
-            targetDir: await _gallery.tempDir());
-        // 解码产物已被原生 transform 转正,不再注入方向(防二次旋转)。
-        final jpeg = await _rawDecoder!
-            .decodeJpeg(dl.path, maxPixelSize: previewMaxPixelSize);
-        await File(path).writeAsBytes(jpeg);
-        _remember(ThumbSource.preview, 'hq_$key', path, jpeg.length);
-        await _evictIfNeeded(ThumbSource.preview);
-        _upgradeCtrl.add(
-            (handle: entry.handle, sizeInBytes: entry.sizeInBytes, path: path));
-      } on Exception {
-        // 尽力而为:失败不重试本会话(高清缺席,小图继续顶着)
-      } finally {
-        if (dl != null) {
-          try {
-            await File(dl.path).delete();
-          } on FileSystemException {
-            // 删失败不挡(临时目录系统可回收)
-          }
+      if (await File(path).exists()) return path;
+      dl = await _downloader.download(entry,
+          targetDir: await _gallery.tempDir());
+      final jpeg = await _rawDecoder!
+          .decodeJpeg(dl.path, maxPixelSize: previewMaxPixelSize);
+      await File(path).writeAsBytes(jpeg);
+      _remember(ThumbSource.preview, 'hq_$key', path, jpeg.length);
+      await _evictIfNeeded(ThumbSource.preview);
+      _upgradeCtrl.add(
+          (handle: entry.handle, sizeInBytes: entry.sizeInBytes, path: path));
+      return path;
+    } on Exception {
+      return null;
+    } finally {
+      if (dl != null) {
+        try {
+          await File(dl.path).delete();
+        } on FileSystemException {
+          // 临时目录交给系统回收。
         }
       }
-    } finally {
-      _hqWarming = null;
-      final next = _hqNext;
-      _hqNext = null;
-      if (next != null) {
-        await warmPreview(next); // 排队里的最新一张接棒
-      }
     }
+  }
+
+  Future<String?> cachedHighQualityPreview(ObjectEntry entry) async {
+    final dir = await _dirFor(ThumbSource.preview);
+    final key = 'hq_${_keyFor(entry)}';
+    final path = '$dir/$key.jpg';
+    if (!await File(path).exists()) return null;
+    _remember(ThumbSource.preview, key, path, await File(path).length());
+    return path;
   }
 
   /// 取 [entry] 在 [source] 档位的缩略图文件路径;内存/磁盘未命中时
@@ -265,6 +298,8 @@ class ThumbnailCache {
     ThumbSource source, {
     ThumbPriority priority = ThumbPriority.interactive,
   }) {
+    // 兼容路径的网格和查看器都显示 JPEG 内嵌缩略图，复用缓存与在途请求。
+    if (entry.requiresExtendedRead) source = ThumbSource.grid;
     final key = _keyFor(entry);
     final lru = _lruFor(source);
     // 命中即刷到 LRU 尾部(最新端);**盘档已无的命中当未命中**(LRU
@@ -326,7 +361,8 @@ class ThumbnailCache {
 
   /// 屏外预取滚入视口时提升排队位置;已开始的相机事务不打断。
   void promote(ObjectEntry entry, ThumbSource source) {
-    _promote((source, _keyFor(entry)));
+    _promote((entry.requiresExtendedRead ? ThumbSource.grid : source,
+        _keyFor(entry)));
   }
 
   void _promote((ThumbSource, String) pendingKey) {
@@ -379,7 +415,10 @@ class ThumbnailCache {
       Uint8List? head;
       for (final size in const [64 * 1024, 16 * 1024]) {
         try {
-          final chunk = await _session.getPartialObject(entry.handle, 0, size);
+          final chunk = entry.requiresExtendedRead
+              ? await _session.getPartialObjectEx(
+                  entry.handle, 0, entry.sizeInBytes.clamp(1, size).toInt())
+              : await _session.getPartialObject(entry.handle, 0, size);
           if (chunk.isNotEmpty) {
             head = chunk;
             break;
@@ -516,6 +555,7 @@ class ThumbnailCache {
     if (!await file.exists()) {
       final head = await _session.getPartialObjectEx(
           entry.handle, 0, entry.sizeInBytes.clamp(1, 65536).toInt());
+      _exifCards.putIfAbsent(key, () => Future.value(exifCardFromHead(head)));
       final thumbnail = jpegEmbeddedThumbnail(head);
       if (thumbnail != null) {
         await file.writeAsBytes(thumbnail);

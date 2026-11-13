@@ -309,10 +309,11 @@ def read_data_phase(sock: socket.socket, expect_tid: int, collect: bool = True):
     每个数据包的 tid 与 expect_tid 不符时打警告(宽度/回显异常的旁证)。
     """
     payload = b""
-    stats = {"declared": None, "data_packets": 0, "end_payload": 0}
+    stats = {"declared": None, "data_packets": 0, "end_payload": 0, "received": 0}
 
     def append(chunk: bytes) -> None:
         nonlocal payload
+        stats["received"] += len(chunk)
         payload = payload + chunk if collect else (payload + chunk)[:16]
 
     while True:
@@ -542,6 +543,18 @@ def download_gallery_jpeg(cmd: socket.socket, tid: Tid, handle: int, target: Pat
             target.unlink()
             raise
     print(f"已保存 JPEG: {target}，{size}B（与相机报告的对象大小一致）")
+
+
+def probe_gallery_fast_reads(cmd: socket.socket, tid: Tid, handle: int) -> None:
+    """Measure alternate reads without keeping the full object in memory."""
+    for opcode, name in ((0x920F, "GetFhdPicture"), (GET_OBJECT, "GetObject")):
+        start = time.monotonic()
+        _, head, stats, (code, _, _) = cmd_xact(
+            cmd, tid, opcode, [handle], collect=False)
+        elapsed = time.monotonic() - start
+        print(f"{name} (0x{opcode:04X}) <- 0x{code:04X}, "
+              f"实收 {stats['received']}B / 声明 {stats['declared']}B, "
+              f"{elapsed:.2f}s, 头部={head[:8].hex().upper() or '-'}")
 
 
 def parse_object_handle(value: str) -> int:
@@ -867,6 +880,8 @@ def main() -> int:
                     help="图库对照使用本机导出的 ZPill 客户端身份文件")
     ap.add_argument("--gallery-download-jpeg", type=Path, metavar="PATH",
                     help="图库对照后用 0x9421 和 0x9431 保存一张完整 JPEG")
+    ap.add_argument("--gallery-fast-reads", action="store_true",
+                    help="图库对照后额外测试 0x920F 预览和 0x1009 整档读取，只测速不保存")
     gallery_modes = ap.add_mutually_exclusive_group()
     gallery_modes.add_argument("--gallery-compare-remote", action="store_true",
                                help="先读取，再执行遥控模式 1→0，并重复读取")
@@ -927,6 +942,8 @@ def main() -> int:
         ap.error("--client-identity 需要同时指定 --gallery-handle 或 --gallery-pair")
     if args.gallery_download_jpeg is not None and args.gallery_handle is None:
         ap.error("--gallery-download-jpeg 需要同时指定 --gallery-handle")
+    if args.gallery_fast_reads and args.gallery_handle is None:
+        ap.error("--gallery-fast-reads 需要同时指定 --gallery-handle")
     hostname, client_guid = args.client_identity or (args.hostname, NIKON_ANDROID_GUID)
 
     print(f"[1] 正在连接相机 {args.host}:{args.port}…", flush=True)
@@ -1040,6 +1057,8 @@ def main() -> int:
                         result = 1
                 if args.gallery_download_jpeg is not None and result == 0:
                     download_gallery_jpeg(cmd, tid, args.gallery_handle, args.gallery_download_jpeg)
+                if args.gallery_fast_reads and result == 0:
+                    probe_gallery_fast_reads(cmd, tid, args.gallery_handle)
                 _, _, _, (code, _, _) = cmd_xact(
                     cmd, tid, CLOSE_SESSION, dp=DP_NO_DATA)
                 print(f"CloseSession <- 0x{code:04X}")

@@ -272,6 +272,15 @@ class ObjectDownloader {
         // 直接掐链(取消即断链);软取消的即时性代价(一块)远小于断链
         // 代价。Cancel-Drain 机制留传输层留档,生产已无调用方。
         var offset = received;
+        // Z30 STA 实测 256 KiB 起步可减少往返，512 KiB 已接近吞吐平台。
+        final extendedReadPolicy = entry.requiresExtendedRead
+            ? AimdChunkPolicy(
+                initialBytes: 256 * 1024,
+                maxBytes: 512 * 1024,
+                stepBytes: 256 * 1024,
+              )
+            : null;
+        var rejectedLargerBlock = false;
         while (offset < entry.sizeInBytes) {
           if (isCancelled != null && isCancelled()) {
             cancelled = true;
@@ -283,8 +292,9 @@ class ObjectDownloader {
           }
           final useEx = entry.requiresExtendedRead ||
               (_enablePartialObjectEx && (_exUsable ?? true));
-          final policy = useEx ? _exPolicy : _chunkPolicy;
-          final chunkBytes = entry.requiresExtendedRead ? 65536 : policy.currentBytes;
+          final policy = extendedReadPolicy ?? (useEx ? _exPolicy : _chunkPolicy);
+          final chunkBytes =
+              rejectedLargerBlock ? policy.minBytes : policy.currentBytes;
           var want = math.min(chunkBytes, entry.sizeInBytes - offset);
           // 外部块闸(取景在场保帧,见 [_chunkCap]):只钳本块请求,
           // 不喂策略 —— AIMD 演化照常,闸撤即回策略块。
@@ -298,6 +308,15 @@ class ObjectDownloader {
                     .getPartialObjectEx(entry.handle, offset, want)
                 : await _session.getPartialObject(entry.handle, offset, want);
           } on PtpResponseException catch (e) {
+            if (extendedReadPolicy != null &&
+                want > policy.minBytes &&
+                (e.responseCode == PtpResponseCode.invalidParameter ||
+                    e.responseCode == PtpResponseCode.parameterNotSupported)) {
+              rejectedLargerBlock = true;
+              AppLog.w(AppLog.transfer,
+                  '0x9431 拒绝块大小 $want B,从偏移 $offset 用 ${policy.minBytes} B 重试');
+              continue;
+            }
             if (useEx && !entry.requiresExtendedRead && _isExUnsupported(e)) {
               // 能力拒绝(0x2005/0x2006):≠ 链路信号,不喂策略;本会话
               // 降级 0x101B,本块原样重发(continue 不推进 offset,
@@ -308,23 +327,23 @@ class ObjectDownloader {
               _exUsable = false;
               continue;
             }
-            (useEx ? _exPolicy : _chunkPolicy).reportError();
+            policy.reportError();
             rethrow;
           } on TimeoutException {
             // 超时(USB 单事务读超时):链路撑不起这个块大小 —— 喂降。
-            (useEx ? _exPolicy : _chunkPolicy).reportTimeout();
+            policy.reportTimeout();
             rethrow;
           } on PtpCancelledException {
             rethrow; // 取消收口(若上层有取消通道):不惩罚(用户行为 ≠ 链路质量)
           } on Exception {
             // 传输错误(相机拒绝应答 / PTP-IP 看门狗断链 / …):喂降。
-            (useEx ? _exPolicy : _chunkPolicy).reportError();
+            policy.reportError();
             rethrow;
           }
           if (useEx && _exUsable != true) {
             _exUsable = true; // 真发成功:能力坐实
             AppLog.i(AppLog.transfer,
-                '0x9431 接受,Ex 账块 ${_exPolicy.currentBytes ~/ 1024}KB 起爬');
+                '0x9431 接受,Ex 账块 ${policy.currentBytes ~/ 1024}KB 起爬');
           }
           if (chunk.length > want) {
             throw FormatException(

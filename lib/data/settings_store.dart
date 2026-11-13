@@ -76,6 +76,7 @@ const kDeSqueezePresets = [1.0, 1.3, 1.5, 1.6, 2.0];
 final class AppSettings {
   const AppSettings({
     this.autoTransfer = false,
+    this.autoStaHighQualityPreview = false,
     this.autoTransferFormat = PhotoDownloadFormat.both,
     this.quality = TransferQuality.original,
     this.batterySaver = false,
@@ -119,6 +120,7 @@ final class AppSettings {
   });
 
   final bool autoTransfer;
+  final bool autoStaHighQualityPreview;
 
   /// 速传(ObjectAdded 自动下载)的格式过滤:双格式照片组按此选文件。
   final PhotoDownloadFormat autoTransferFormat;
@@ -256,6 +258,7 @@ final class AppSettings {
 
   AppSettings copyWith({
     bool? autoTransfer,
+    bool? autoStaHighQualityPreview,
     PhotoDownloadFormat? autoTransferFormat,
     TransferQuality? quality,
     bool? batterySaver,
@@ -299,6 +302,8 @@ final class AppSettings {
   }) =>
       AppSettings(
         autoTransfer: autoTransfer ?? this.autoTransfer,
+        autoStaHighQualityPreview:
+            autoStaHighQualityPreview ?? this.autoStaHighQualityPreview,
         autoTransferFormat: autoTransferFormat ?? this.autoTransferFormat,
         quality: quality ?? this.quality,
         batterySaver: batterySaver ?? this.batterySaver,
@@ -350,6 +355,7 @@ final class AppSettings {
   bool operator ==(Object other) =>
       other is AppSettings &&
       other.autoTransfer == autoTransfer &&
+      other.autoStaHighQualityPreview == autoStaHighQualityPreview &&
       other.autoTransferFormat == autoTransferFormat &&
       other.quality == quality &&
       other.batterySaver == batterySaver &&
@@ -394,7 +400,8 @@ final class AppSettings {
   @override
   // Object.hash 位置参上限 20,字段 37 个 → hashAll(列表序即上面 == 序)。
   int get hashCode => Object.hashAll([
-        autoTransfer, autoTransferFormat, quality, batterySaver, customSavePath,
+        autoTransfer, autoStaHighQualityPreview, autoTransferFormat, quality,
+        batterySaver, customSavePath,
         themeMode, language, xmpCreator, xmpRights, xmpInjectRating, xmpInjectGps,
         watermarkStyle, watermarkText, feedUpscaler, temporalDenoise,
         autoRotateFeed, deSqueeze,
@@ -410,6 +417,7 @@ final class AppSettings {
 
   Map<String, Object?> toJson() => {
         'autoTransfer': autoTransfer,
+        'autoStaHighQualityPreview': autoStaHighQualityPreview,
         'autoTransferFormat': autoTransferFormat.name,
         'quality': quality.name,
         'batterySaver': batterySaver,
@@ -456,6 +464,7 @@ final class AppSettings {
 
   static AppSettings fromJson(Map<String, Object?> json) => AppSettings(
         autoTransfer: json['autoTransfer'] == true,
+        autoStaHighQualityPreview: json['autoStaHighQualityPreview'] == true,
         autoTransferFormat:
             _enumByName(PhotoDownloadFormat.values, json['autoTransferFormat'])
                 ?? PhotoDownloadFormat.both,

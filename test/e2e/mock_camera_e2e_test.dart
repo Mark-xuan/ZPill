@@ -271,6 +271,20 @@ void main() {
       expect(entry!.requiresExtendedRead, isTrue);
       expect(albums.first.items.expand((group) => group.members)
           .map((member) => member.handle), isNot(contains(_nefHandle)));
+      final countsBeforeRefresh = Map.of(camera.device.opCounts);
+      final refreshed = await repository.refreshAlbums();
+      expect(
+        refreshed
+            .expand((album) => album.items)
+            .expand((group) => group.members)
+            .map((member) => member.handle),
+        contains(_jpgHandle),
+      );
+      expect(camera.device.opCounts, {
+        ...countsBeforeRefresh,
+        PtpOperationCode.getObjectHandles:
+            countsBeforeRefresh[PtpOperationCode.getObjectHandles]! + 1,
+      });
       final dir = await Directory.systemTemp.createTemp('z30-sta-download-');
       addTearDown(() => dir.delete(recursive: true));
       final download = await ObjectDownloader(session: live.session)

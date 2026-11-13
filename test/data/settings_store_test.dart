@@ -22,6 +22,7 @@ void main() {
   test('默认设置:文件不存在 → 全默认', () async {
     final s = await store.current();
     expect(s.autoTransfer, isFalse);
+    expect(s.autoStaHighQualityPreview, isFalse);
     expect(s.autoTransferFormat, PhotoDownloadFormat.both);
     expect(s.quality, TransferQuality.original);
   });
@@ -31,6 +32,7 @@ void main() {
     store.settings.listen(updates.add);
     final next = const AppSettings().copyWith(
       autoTransfer: true,
+      autoStaHighQualityPreview: true,
       autoTransferFormat: PhotoDownloadFormat.raw,
       batterySaver: true,
       customSavePath: '/tmp/x',

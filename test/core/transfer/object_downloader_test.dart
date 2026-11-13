@@ -607,6 +607,66 @@ void main() {
                 fastThreshold: const Duration(days: 1)),
       );
 
+  test('Z30 STA: 大块被拒后从同一偏移以 64 KiB 完成下载', () async {
+    const blockBytes = 64 * 1024;
+    const entry = ObjectEntry(
+      handle: 0x12,
+      name: 'Z30.JPG',
+      sizeInBytes: 4 * blockBytes,
+      kind: ObjectKind.image,
+      requiresExtendedRead: true,
+    );
+    final fake = FakePtpTransport();
+    fake.fail(const PtpResponseException(
+      opcode: NikonOperationCode.getPartialObjectEx,
+      responseCode: PtpResponseCode.invalidParameter,
+    ));
+    for (var i = 0; i < 4; i++) {
+      fake.reply(_okData(Uint8List(blockBytes)..fillRange(0, blockBytes, i)));
+    }
+
+    final result =
+        await downloaderFor(fake).download(entry, targetDir: dir.path);
+
+    expect(fake.requests.map((r) => r.opcode),
+        List.filled(5, NikonOperationCode.getPartialObjectEx));
+    expect(fake.requests.map((r) => r.params), [
+      [entry.handle, 0, 0, 4 * blockBytes, 0],
+      [entry.handle, 0, 0, blockBytes, 0],
+      [entry.handle, blockBytes, 0, blockBytes, 0],
+      [entry.handle, 2 * blockBytes, 0, blockBytes, 0],
+      [entry.handle, 3 * blockBytes, 0, blockBytes, 0],
+    ]);
+    final downloaded = await File(result.path).readAsBytes();
+    expect(downloaded.length, entry.sizeInBytes);
+    expect(downloaded, List.generate(entry.sizeInBytes, (i) => i ~/ blockBytes));
+  });
+
+  test('Z30 STA: 从 256 KiB 起步，快块增至 512 KiB', () async {
+    const kib = 1024;
+    const entry = ObjectEntry(
+      handle: 0x12,
+      name: 'Z30.JPG',
+      sizeInBytes: 1024 * kib,
+      kind: ObjectKind.image,
+      requiresExtendedRead: true,
+    );
+    final fake = FakePtpTransport()
+      ..reply(_okData(Uint8List(256 * kib)))
+      ..reply(_okData(Uint8List(512 * kib)))
+      ..reply(_okData(Uint8List(256 * kib)));
+
+    final result =
+        await downloaderFor(fake).download(entry, targetDir: dir.path);
+
+    expect(result.bytes, entry.sizeInBytes);
+    expect(fake.requests.map((r) => r.params), [
+      [entry.handle, 0, 0, 256 * kib, 0],
+      [entry.handle, 256 * kib, 0, 512 * kib, 0],
+      [entry.handle, 768 * kib, 0, 256 * kib, 0],
+    ]);
+  });
+
   test('Ex 首选:首块即 0x9431,u64 参数低高拆分,AIMD 单独演化', () async {
     final fake = FakePtpTransport();
     final exPolicy = fastAlwaysPolicy(maxBytes: 200, initialBytes: 64);

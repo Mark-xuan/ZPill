@@ -124,6 +124,9 @@ final class _FakeThumbs implements ThumbnailCache {
 
   _FakeThumbs({this.failHandles = const {}});
 
+  static String pathForHandle(int handle) =>
+      '${Directory.systemTemp.path}/zpill_test_thumb_$handle.jpg';
+
   @override
   int get previewMaxPixelSize => 2560;
 
@@ -137,7 +140,7 @@ final class _FakeThumbs implements ThumbnailCache {
     if (failHandles.contains(entry.handle)) {
       throw Exception('假失败:${entry.name}');
     }
-    final path = '/tmp/zpill_test_thumb_${entry.handle}.jpg';
+    final path = pathForHandle(entry.handle);
     File(path).writeAsBytesSync(_tinyPng);
     return path;
   }
@@ -156,6 +159,13 @@ final class _FakeThumbs implements ThumbnailCache {
 
   @override
   Future<void> warmPreview(ObjectEntry entry) async {}
+
+  @override
+  Future<String?> cachedHighQualityPreview(ObjectEntry entry) async => null;
+
+  @override
+  Future<String?> loadHighQualityPreview(ObjectEntry entry,
+      {bool Function()? stillWanted}) async => null;
 
   @override
   int get gridLimitBytes => 0;
@@ -1370,7 +1380,7 @@ void main() {
         find.byWidgetPredicate((w) =>
             w is Image &&
             w.image ==
-                FileImage(File('/tmp/zpill_test_thumb_1.jpg'))),
+                FileImage(File(_FakeThumbs.pathForHandle(1)))),
         findsOneWidget);
 
     // 收查看器:配对件仍在两侧,回程航班落回格位。
